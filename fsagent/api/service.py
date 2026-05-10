@@ -219,7 +219,7 @@ class FsAgentApiService:
             record.session.status = "executing"
             record.session.todos = _todos(event.get("todos"), fallback=record.session.todos)
             record.session.execution_log = _execution_log(event.get("execution_log"))
-        self._append_event(record, kind, message)
+        self._append_event(record, kind, message, **_progress_log_fields(event))
         record.session.updated_at = _now()
 
     async def _invoke_once(self, record: SessionRecord, payload: object) -> None:
@@ -425,6 +425,11 @@ def _session_log_fields(session: SessionResponse) -> dict[str, object]:
 
 def _event(kind: str, message: str) -> TimelineEvent:
     return TimelineEvent(id=_uid(), kind=kind, message=message, at=_now())
+
+
+def _progress_log_fields(event: Mapping[str, object]) -> dict[str, object]:
+    excluded = {"kind", "message", "todos", "execution_log", "plan_meta"}
+    return {str(key): value for key, value in event.items() if key not in excluded}
 
 
 def _uid() -> str:
