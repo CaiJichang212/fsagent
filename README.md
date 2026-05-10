@@ -205,13 +205,28 @@ MCP 默认不加载。API 请求中需要设置：
 
 ## 日志
 
-后端日志使用 JSON Lines 格式，覆盖 HTTP 请求、session 生命周期、Plan 审核、planner/executor 进度和异常 traceback。可通过环境变量调整日志级别和输出位置：
+后端日志使用 JSON Lines 格式，覆盖 HTTP 请求、session 生命周期、Fast/Plan agent 模型轮次、工具调用摘要、Plan 审核、planner/executor 进度和异常 traceback。可通过环境变量调整日志级别和输出位置：
 
 ```bash
 FSAGENT_LOG_LEVEL=DEBUG FSAGENT_LOG_FILE=logs/fsagent-api.jsonl ./scripts/start-dev.sh
 ```
 
-未设置 `FSAGENT_LOG_FILE` 时，日志输出到 stdout。
+未设置 `FSAGENT_LOG_FILE` 时，日志输出到 stdout。`./scripts/start-dev.sh` 默认导出 `FSAGENT_LOG_LEVEL=DEBUG` 和 `FSAGENT_LOG_FILE=logs/fsagent-api.jsonl`，调用时显式传入的同名环境变量优先。
+
+细粒度 agent 事件统一使用 `agent.*` 前缀，并通过 `agent_mode` 与 `phase` 区分 Fast、Plan planner 和 Plan executor。Plan 模式中，planner 在审核前只生成计划草案并写入 `write_todos`，不加载普通工具或 MCP 执行工具；用户批准后才由 executor 调用执行工具。例如：
+
+```json
+{"event":"agent.tool.completed","agent_mode":"plan","phase":"executor","tool_name":"read_file","duration_ms":18.4,"result_size_chars":2048}
+{"event":"agent.tool.completed","agent_mode":"plan","phase":"planner","tool_name":"write_todos","duration_ms":3.1,"result_size_chars":128}
+```
+
+默认只记录摘要和元数据，包括工具名、参数 key、输入/输出长度、耗时和错误类型；不会记录完整 prompt、工具参数值或工具结果正文。常用排障命令：
+
+```bash
+tail -f logs/fsagent-api.jsonl
+rg '"event":"agent.tool.failed"|"event":"agent.model.failed"' logs/fsagent-api.jsonl
+rg '"session_id":"<session-id>"' logs/fsagent-api.jsonl
+```
 
 ## 测试与质量检查
 
