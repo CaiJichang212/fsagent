@@ -15,6 +15,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langgraph.types import Checkpointer, Command, interrupt
 
+from fsagent.runtime.agent_observability import AgentLogContext, AgentObservabilityMiddleware, emit_agent_event
 from fsagent.runtime.approval import build_plan_review_payload, normalize_review_command
 from fsagent.runtime.executor import execute_plan
 from fsagent.runtime.fast import create_fast_agent, run_fast
@@ -27,7 +28,7 @@ from fsagent.runtime.state import RuntimeState
 ProgressCallback = Callable[[Mapping[str, object]], Awaitable[None]]
 
 
-def create_runtime(
+def create_runtime(  # noqa: C901
     model: str | BaseChatModel,
     tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
     *,
@@ -72,21 +73,36 @@ def create_runtime(
         return [*(tools or []), *mcp.tools]
 
     async def fast_runner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
+        on_event = _progress_callback(config)
         agent = create_fast_agent(
             model=model,
             tools=await combined_tools(),
             system_prompt=_system_prompt_text(system_prompt),
+            middleware=[
+                AgentObservabilityMiddleware(
+                    context=AgentLogContext(agent_mode="fast", phase="fast_runner"),
+                    on_event=on_event,
+                )
+            ],
+            on_event=on_event,
         )
         content = _last_user_content(state)
-        final = await run_fast(agent=agent, content=content, config=config)
+        final = await run_fast(agent=agent, content=content, config=config, on_event=on_event)
         return {"final_response": final}
 
     async def planner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         await _emit_progress(config, {"kind": "planner.started", "message": "开始生成计划"})
+        on_event = _progress_callback(config)
         agent = create_deep_agent(
             model=model,
-            tools=await combined_tools(),
+            tools=[],
             system_prompt=_join_prompts(system_prompt, PLANNER_SYSTEM_PROMPT),
+            middleware=[
+                AgentObservabilityMiddleware(
+                    context=AgentLogContext(agent_mode="plan", phase="planner"),
+                    on_event=on_event,
+                )
+            ],
             skills=skills,
             memory=memory,
             backend=backend,
@@ -94,11 +110,24 @@ def create_runtime(
             checkpointer=checkpointer,
             store=store,
         )
+        await emit_agent_event(
+            on_event,
+            AgentLogContext(agent_mode="plan", phase="planner"),
+            "agent.started",
+            "计划生成 agent 启动",
+        )
         generated = await generate_plan(
             agent=agent,
             content=_last_user_content(state),
             feedback=state.get("plan_feedback"),
             config=config,
+        )
+        await emit_agent_event(
+            on_event,
+            AgentLogContext(agent_mode="plan", phase="planner"),
+            "agent.completed",
+            "计划生成 agent 完成(待审核)",
+            todo_count=len(generated.todos),
         )
         await _emit_progress(
             config,
@@ -136,7 +165,15 @@ def create_runtime(
         return Command(update={"final_response": None}, goto=END)
 
     async def executor(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
-        middleware = [HumanInTheLoopMiddleware(interrupt_on)] if interrupt_on is not None else []
+        on_event = _progress_callback(config)
+        middleware = [
+            AgentObservabilityMiddleware(
+                context=AgentLogContext(agent_mode="plan", phase="executor"),
+                on_event=on_event,
+            )
+        ]
+        if interrupt_on is not None:
+            middleware.append(HumanInTheLoopMiddleware(interrupt_on))
         agent = create_deep_agent(
             model=model,
             tools=await combined_tools(),
@@ -149,12 +186,27 @@ def create_runtime(
             checkpointer=checkpointer,
             store=store,
         )
+        await emit_agent_event(
+            on_event,
+            AgentLogContext(agent_mode="plan", phase="executor"),
+            "agent.started",
+            "Executor agent 启动",
+            todo_count=len(state["todos"]),
+        )
         result = await execute_plan(
             agent=agent,
             todos=state["todos"],
             plan_meta=state.get("plan_meta"),
             config=config,
             on_event=_progress_callback(config),
+        )
+        await emit_agent_event(
+            on_event,
+            AgentLogContext(agent_mode="plan", phase="executor"),
+            "agent.completed",
+            "Executor agent 完成",
+            todo_count=len(result.todos),
+            execution_log_count=len(result.execution_log),
         )
         return {"todos": result.todos, "execution_log": result.execution_log, "final_response": result.final_result}
 

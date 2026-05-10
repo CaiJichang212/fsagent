@@ -16,6 +16,12 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
+from fsagent.runtime.agent_observability import (
+    AgentLogContext,
+    ProgressCallback,
+    emit_agent_event,
+    emit_agent_event_sync,
+)
 from fsagent.runtime.prompts import FAST_SYSTEM_PROMPT
 from fsagent.runtime.state import RuntimeState
 
@@ -24,6 +30,16 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
     """Allow fast mode to use tools in at most one model turn."""
 
     state_schema = RuntimeState
+
+    def __init__(
+        self,
+        *,
+        context: AgentLogContext | None = None,
+        on_event: ProgressCallback | None = None,
+    ) -> None:
+        """Initialize the middleware."""
+        self._context = context or AgentLogContext(agent_mode="fast", phase="fast_runner")
+        self._on_event = on_event
 
     def wrap_model_call(
         self,
@@ -40,6 +56,7 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
             Model response, optionally with a state update marking the tool round used.
         """
         limited_request = self._disable_tools_if_used(request)
+        self._emit_tools_disabled_if_needed(request, len(request.tools))
         response = handler(limited_request)
         if self._response_has_tool_calls(response) and not request.state.get("fast_tool_round_used", False):
             return ExtendedModelResponse(
@@ -55,6 +72,7 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
     ) -> ModelResponse[Any] | ExtendedModelResponse[Any]:
         """Async variant of `wrap_model_call`."""
         limited_request = self._disable_tools_if_used(request)
+        await self._emit_tools_disabled_if_needed_async(request, len(request.tools))
         response = await handler(limited_request)
         if self._response_has_tool_calls(response) and not request.state.get("fast_tool_round_used", False):
             return ExtendedModelResponse(
@@ -73,12 +91,38 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
     def _response_has_tool_calls(response: ModelResponse[Any]) -> bool:
         return any(isinstance(message, AIMessage) and message.tool_calls for message in response.result)
 
+    def _emit_tools_disabled_if_needed(self, request: ModelRequest[Any], available_tool_count: int) -> None:
+        if request.state.get("fast_tool_round_used", False) and available_tool_count > 0:
+            emit_agent_event_sync(
+                self._on_event,
+                self._context,
+                "agent.tools.disabled",
+                "Fast 模式已使用过工具轮次, 后续模型调用禁用工具",
+                available_tool_count=available_tool_count,
+            )
+
+    async def _emit_tools_disabled_if_needed_async(
+        self,
+        request: ModelRequest[Any],
+        available_tool_count: int,
+    ) -> None:
+        if request.state.get("fast_tool_round_used", False) and available_tool_count > 0:
+            await emit_agent_event(
+                self._on_event,
+                self._context,
+                "agent.tools.disabled",
+                "Fast 模式已使用过工具轮次, 后续模型调用禁用工具",
+                available_tool_count=available_tool_count,
+            )
+
 
 def create_fast_agent(
     *,
     model: str | BaseChatModel,
     tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
     system_prompt: str | None = None,
+    middleware: Sequence[AgentMiddleware[RuntimeState, Any, Any]] | None = None,
+    on_event: ProgressCallback | None = None,
 ) -> object:
     """Create a fast-mode agent without `TodoListMiddleware`.
 
@@ -86,6 +130,8 @@ def create_fast_agent(
         model: Chat model or model identifier.
         tools: Tools available during the single permitted tool round.
         system_prompt: Optional caller prompt layered before the fast prompt.
+        middleware: Additional agent middleware to install before the fast tool limiter.
+        on_event: Optional progress callback for fast tool limiter events.
 
     Returns:
         Compiled LangChain agent.
@@ -95,7 +141,13 @@ def create_fast_agent(
         model=model,
         tools=list(tools or []),
         system_prompt=prompt,
-        middleware=[FastToolRoundMiddleware()],
+        middleware=[
+            *(middleware or []),
+            FastToolRoundMiddleware(
+                context=AgentLogContext(agent_mode="fast", phase="fast_runner"),
+                on_event=on_event,
+            ),
+        ],
     )
 
 
@@ -104,6 +156,7 @@ async def run_fast(
     agent: object,
     content: str,
     config: RunnableConfig | None = None,
+    on_event: ProgressCallback | None = None,
 ) -> str:
     """Run a fast-mode request and return the final assistant text.
 
@@ -111,15 +164,26 @@ async def run_fast(
         agent: Fast agent with `ainvoke`.
         content: User task.
         config: Optional LangGraph runnable config.
+        on_event: Optional progress callback for fast lifecycle events.
 
     Returns:
         Final text response.
     """
+    context = AgentLogContext(agent_mode="fast", phase="fast_runner")
+    await emit_agent_event(on_event, context, "agent.started", "Fast agent 启动", message_length=len(content))
     result = await agent.ainvoke(  # type: ignore[attr-defined]
         {"messages": [HumanMessage(content=content)], "mode": "fast", "fast_tool_round_used": False},
         config=config,
     )
-    return _extract_text(result)
+    final = _extract_text(result)
+    await emit_agent_event(
+        on_event,
+        context,
+        "agent.completed",
+        "Fast agent 完成",
+        final_response_length=len(final),
+    )
+    return final
 
 
 def _extract_text(result: object) -> str:

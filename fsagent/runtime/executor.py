@@ -73,6 +73,8 @@ async def execute_plan(
                 {
                     "messages": [HumanMessage(content=prompt)],
                     "todos": [dict(current_todo)],
+                    "fsagent_todo_index": index + 1,
+                    "fsagent_todo_content": todo["content"],
                 },
                 config=_todo_execution_config(config, index),
             )

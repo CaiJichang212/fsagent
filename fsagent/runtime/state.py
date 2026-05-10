@@ -52,6 +52,8 @@ class RuntimeState(PlanningState):
     plan_review_count: NotRequired[int]
     plan_feedback: NotRequired[str | None]
     fast_tool_round_used: NotRequired[bool]
+    fsagent_todo_index: NotRequired[int]
+    fsagent_todo_content: NotRequired[str]
     execution_log: NotRequired[list[ExecutionLogEntry]]
     final_response: NotRequired[str | None]
     artifacts: NotRequired[list[str]]
