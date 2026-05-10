@@ -209,6 +209,39 @@ class EventRuntime(FakeRuntime):
         return self.outputs.pop(0)
 
 
+class AgentEventRuntime(FakeRuntime):
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        sink = (config.get("metadata") or {}).get("fsagent_event_sink")
+        if sink is not None:
+            await sink(
+                {
+                    "kind": "agent.model.completed",
+                    "message": "fast_runner 模型调用完成",
+                    "agent_mode": "fast",
+                    "phase": "fast_runner",
+                    "turn_index": 1,
+                    "duration_ms": 12.5,
+                    "tool_call_count": 0,
+                }
+            )
+        return self.outputs.pop(0)
+
+
+def test_stream_fast_run_sends_agent_timeline_events():
+    runtime = AgentEventRuntime([{"final_response": "fast streamed result"}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    with client.stream("POST", "/api/runs/stream", json=_run_payload(mode="fast")) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    sessions = _sse_sessions(body)
+    assert any(item["timeline"][-1]["kind"] == "agent.model.completed" for item in sessions)
+    assert sessions[-1]["status"] == "completed"
+
+
 def test_stream_create_run_sends_incremental_session_events():
     runtime = EventRuntime(
         [
@@ -274,6 +307,37 @@ async def test_stream_create_run_logs_duplicate_progress_once():
     assert snapshots[-1].status == "completed"
     progress_logs = [record for record in records if getattr(record, "event", None) == "planner.started"]
     assert len(progress_logs) == 1
+
+
+async def test_agent_progress_events_log_structured_metadata():
+    runtime = AgentEventRuntime([{"final_response": "ok"}])
+    service = _service(runtime)
+    records: list[logging.LogRecord] = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    service_logger = logging.getLogger("fsagent.api.service")
+    previous_handlers = list(service_logger.handlers)
+    previous_propagate = service_logger.propagate
+    previous_level = service_logger.level
+    service_logger.handlers = [ListHandler()]
+    service_logger.propagate = False
+    service_logger.setLevel(logging.INFO)
+    try:
+        snapshots = [session async for session in service.create_run_stream(RunRequest(**_run_payload(mode="fast")))]
+    finally:
+        service_logger.handlers = previous_handlers
+        service_logger.propagate = previous_propagate
+        service_logger.setLevel(previous_level)
+
+    assert snapshots[-1].status == "completed"
+    progress_logs = [record for record in records if getattr(record, "event", None) == "agent.model.completed"]
+    assert len(progress_logs) == 1
+    assert progress_logs[0].agent_mode == "fast"
+    assert progress_logs[0].phase == "fast_runner"
+    assert progress_logs[0].duration_ms == 12.5
 
 
 def test_stream_review_plan_sends_incremental_session_events():

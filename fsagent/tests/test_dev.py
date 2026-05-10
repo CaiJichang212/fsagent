@@ -84,3 +84,10 @@ def test_start_commands_use_configured_ports():
         "--no-access-log",
     ]
     assert frontend_cmd == ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "3000"]
+
+
+def test_start_dev_script_exports_default_log_environment():
+    script = Path("scripts/start-dev.sh").read_text(encoding="utf-8")
+
+    assert 'export FSAGENT_LOG_LEVEL="${FSAGENT_LOG_LEVEL:-DEBUG}"' in script
+    assert 'export FSAGENT_LOG_FILE="${FSAGENT_LOG_FILE:-logs/fsagent-api.jsonl}"' in script

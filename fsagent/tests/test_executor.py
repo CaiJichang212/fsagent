@@ -72,6 +72,10 @@ async def test_execute_plan_invokes_agent_with_only_current_todo_state():
         [{"content": "第一项", "status": "in_progress"}],
         [{"content": "第二项", "status": "in_progress"}],
     ]
+    assert [(state["fsagent_todo_index"], state["fsagent_todo_content"]) for state in agent.states] == [
+        (1, "第一项"),
+        (2, "第二项"),
+    ]
     assert "第二项" not in agent.messages[0]
     assert "第一项" not in agent.messages[1]
 
