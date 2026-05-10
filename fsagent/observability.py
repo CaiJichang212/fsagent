@@ -152,9 +152,7 @@ def _fingerprint(*, event: str, message: str, fields: Mapping[str, object]) -> s
     payload = {
         "event": event,
         "message": message,
-        "fields": _normalize_value(
-            {key: value for key, value in fields.items() if key not in _DEDUPE_IGNORED_FIELDS}
-        ),
+        "fields": _normalize_value({key: value for key, value in fields.items() if key not in _DEDUPE_IGNORED_FIELDS}),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return sha256(raw.encode("utf-8")).hexdigest()
