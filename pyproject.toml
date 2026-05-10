@@ -12,6 +12,7 @@ dependencies = [
     "langchain-mcp-adapters",
     "langchain-qwq",
     "langgraph",
+    "pyyaml>=6.0.0",
     "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
