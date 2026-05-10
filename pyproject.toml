@@ -16,7 +16,6 @@ dependencies = [
 ]
 
 [project.scripts]
-fsagent = "fsagent.cli:main"
 fsagent-api = "fsagent.api.server:main"
 fsagent-dev = "fsagent.dev:main"
 

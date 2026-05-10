@@ -1,6 +1,6 @@
 # fsagent
 
-`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供命令行、FastAPI 服务和 React 前端，用于在同一套 LangGraph runtime 上运行快速问答或可审核计划执行流程。
+`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供 FastAPI 服务和 React 前端，用于在同一套 LangGraph runtime 上运行快速问答或可审核计划执行流程。
 
 ## 功能概览
 
@@ -16,7 +16,6 @@
 ```text
 .
 ├── fsagent/
-│   ├── cli.py                 # CLI 入口：fsagent
 │   ├── dev.py                 # API + 前端开发启动器：fsagent-dev
 │   ├── api/                   # FastAPI schema、server、session service
 │   ├── runtime/               # Fast/Plan runtime、planner、executor、MCP、模型配置
@@ -76,7 +75,7 @@ AVAILABLE_MODELS_JSON=model_config.json
 
 说明：
 
-- `MODEL`：默认模型名称，可被 CLI 参数或 API 请求覆盖。
+- `MODEL`：默认模型名称，可被 API 请求覆盖。
 - `BASE_URL`：OpenAI-compatible 模型服务地址。
 - `API_KEY`：模型服务密钥；不要提交真实值。
 - `AVAILABLE_MODELS_JSON`：模型目录配置，默认读取项目根目录的 `model_config.json`。
@@ -124,33 +123,6 @@ npm run dev
 ```
 
 前端 Vite 代理会把 `/api` 转发到 `FSAGENT_API_TARGET`，未设置时默认代理到 `http://127.0.0.1:8000`。
-
-## CLI 使用
-
-CLI 入口为 `fsagent`，消息必须以 `/fast` 或 `/plan` 开头：
-
-```bash
-uv run fsagent "/fast 总结当前项目结构"
-uv run fsagent "/plan 为这个项目生成测试策略"
-```
-
-常用参数：
-
-```bash
-uv run fsagent "/fast 你的任务" --model Qwen/Qwen3.5-35B-A3B
-uv run fsagent "/fast 你的任务" --env-file .env
-uv run fsagent "/plan 你的任务" --mcp-config mcp.json
-uv run fsagent "/plan 你的任务" --no-mcp
-uv run fsagent "/plan 你的任务" --mcp-config mcp.json --trust-project-mcp
-```
-
-如果当前目录在 monorepo 根目录：
-
-```bash
-uv run --project harnessagents/fsagent fsagent "/fast 总结当前项目结构"
-```
-
-Plan 模式在 CLI 中会输出待审核计划；当前 CLI 尚未实现 resume 审核流程，完整审核体验请使用 API/前端。
 
 ## API
 
@@ -229,12 +201,6 @@ MCP 默认不加载。API 请求中需要设置：
 }
 ```
 
-CLI 中对应参数为：
-
-```bash
---mcp-config mcp.json --trust-project-mcp
-```
-
 不要在未确认 MCP 配置可信时启用项目 stdio MCP server。
 
 ## 日志
@@ -273,12 +239,10 @@ uv run --project harnessagents/fsagent --group test pytest harnessagents/fsagent
 ## 开发约定
 
 - 后端公共入口：
-  - CLI：`fsagent.cli:main`
   - API：`fsagent.api.server:main`
   - 开发启动器：`fsagent.dev:main`
 - Runtime 行为变更优先补充 `fsagent/tests/` 中的对应测试。
 - API schema、session 状态或 runtime 输出变化时，重点检查 `test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py`。
-- CLI 参数或输出变化时，重点检查 `test_cli.py`。
 - 开发启动器变化时，重点检查 `test_dev.py`。
 - 模型配置逻辑变化时，重点检查 `test_model_config.py`。
 - 不要提交真实 `.env`、API Key、令牌或本地私密配置。
