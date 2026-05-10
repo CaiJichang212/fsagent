@@ -49,6 +49,7 @@ export interface TimelineEvent {
     | "agent.tools.disabled"
     | "agent.completed"
     | "planner.started"
+    | "planner.capability_warning"
     | "planner.completed"
     | "interrupt.plan_review"
     | "plan.approved"
