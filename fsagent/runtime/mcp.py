@@ -27,6 +27,51 @@ class RuntimeMCPResult:
     server_infos: list[object] = field(default_factory=list)
 
 
+def describe_mcp_config_for_planner(
+    config_path: str | None,
+    *,
+    no_mcp: bool,
+    trust_project_mcp: bool | None,
+    item_limit: int | None = None,
+    warnings: list[str] | None = None,
+) -> str:
+    """Return a static MCP capability summary without starting MCP clients."""
+    if no_mcp:
+        return "MCP tools are disabled for this run."
+    if config_path is None:
+        return "No MCP config is configured for executor."
+
+    resolved_config_path = resolve_mcp_config_path(config_path)
+    if resolved_config_path is None or not Path(resolved_config_path).exists():
+        return "MCP config is configured but not found; executor will report the error after approval."
+
+    try:
+        raw = json.loads(Path(resolved_config_path).read_text(encoding="utf-8"))
+        normalized = _normalize_explicit_mcp_config(raw, trust_project_mcp=trust_project_mcp)
+    except Exception:  # noqa: BLE001  # planning must not fail while only summarizing executor capabilities
+        return "MCP config is configured but could not be summarized; executor will report parse errors after approval."
+
+    server_names = sorted(normalized["mcpServers"])
+    if not server_names:
+        return "No trusted/enabled MCP servers are available to executor after approval."
+    lines = ["MCP servers/tools available to executor after approval:"]
+    for server_name in server_names:
+        server = normalized["mcpServers"][server_name]
+        lines.append(f"  - {_format_capability_line(server_name, _string_value(server.get('description')))}")
+        tool_summaries = _static_mcp_tool_summaries(server)
+        visible_tool_summaries = tool_summaries if item_limit is None else tool_summaries[:item_limit]
+        omitted_count = max(len(tool_summaries) - len(visible_tool_summaries), 0)
+        for tool_name, tool_description in visible_tool_summaries:
+            lines.append(f"    - {_format_capability_line(tool_name, tool_description)}")
+        if omitted_count:
+            lines.append(f"    - +{omitted_count} more")
+            if warnings is not None:
+                warnings.append(
+                    f"MCP server {server_name} tools truncated to {item_limit} items; +{omitted_count} more omitted."
+                )
+    return "\n".join(lines)
+
+
 async def load_runtime_mcp_tools(
     config_path: str | None,
     *,
@@ -205,6 +250,57 @@ def _normalize_explicit_mcp_server(
     if transport in {"http", "streamable_http", "streamable-http", "sse"}:
         return dict(server)
     return None
+
+
+def _static_mcp_tool_summaries(server: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """Return configured MCP tool metadata without connecting to MCP servers."""
+    raw_tools = server.get("tools") or server.get("tool_descriptions") or server.get("toolDescriptions")
+    if isinstance(raw_tools, dict):
+        return _static_mcp_tool_summaries_from_mapping(raw_tools)
+    if isinstance(raw_tools, list):
+        return _static_mcp_tool_summaries_from_list(raw_tools)
+    return []
+
+
+def _static_mcp_tool_summaries_from_mapping(raw_tools: dict[object, object]) -> list[tuple[str, str | None]]:
+    summaries: list[tuple[str, str | None]] = []
+    for raw_name, raw_tool in raw_tools.items():
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        if isinstance(raw_tool, dict):
+            summaries.append((name, _string_value(raw_tool.get("description"))))
+        else:
+            summaries.append((name, _string_value(raw_tool)))
+    return sorted(summaries)
+
+
+def _static_mcp_tool_summaries_from_list(raw_tools: list[object]) -> list[tuple[str, str | None]]:
+    summaries: list[tuple[str, str | None]] = []
+    for raw_tool in raw_tools:
+        if isinstance(raw_tool, str):
+            name = raw_tool.strip()
+            if name:
+                summaries.append((name, None))
+            continue
+        if not isinstance(raw_tool, dict):
+            continue
+        name = _string_value(raw_tool.get("name"))
+        if name is None:
+            continue
+        summaries.append((name, _string_value(raw_tool.get("description"))))
+    return sorted(summaries)
+
+
+def _format_capability_line(name: str, description: str | None) -> str:
+    return f"{name} - {description}" if description else name
+
+
+def _string_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    return normalized or None
 
 
 def _make_mcp_tool_errors_nonfatal(tools: list[BaseTool]) -> list[BaseTool]:
