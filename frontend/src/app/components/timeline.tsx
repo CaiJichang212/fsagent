@@ -34,6 +34,7 @@ const ICONS: Record<TimelineEvent["kind"], React.ReactNode> = {
   "agent.tools.disabled": <Ban className="w-3.5 h-3.5" />,
   "agent.completed": <Check className="w-3.5 h-3.5" />,
   "planner.started": <Cog className="w-3.5 h-3.5" />,
+  "planner.capability_warning": <AlertTriangle className="w-3.5 h-3.5" />,
   "planner.completed": <ListChecks className="w-3.5 h-3.5" />,
   "interrupt.plan_review": <Pause className="w-3.5 h-3.5" />,
   "plan.approved": <Check className="w-3.5 h-3.5" />,
@@ -50,6 +51,7 @@ const ICONS: Record<TimelineEvent["kind"], React.ReactNode> = {
 
 const TONE: Partial<Record<TimelineEvent["kind"], string>> = {
   "interrupt.plan_review": "text-amber-500 bg-amber-500/15",
+  "planner.capability_warning": "text-amber-500 bg-amber-500/15",
   "plan.cancelled": "text-destructive bg-destructive/15",
   "agent.model.failed": "text-destructive bg-destructive/15",
   "agent.tool.failed": "text-destructive bg-destructive/15",
