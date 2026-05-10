@@ -12,6 +12,22 @@ After writing todos, summarize plan metadata including goal, assumptions, and fi
 Do not execute the plan yet.
 """
 
+PLANNER_TODO_SYSTEM_PROMPT = """## `write_todos` in plan review mode
+
+You have access to `write_todos` only to submit a draft plan for user review.
+Use it to create a concise list of concrete executable steps.
+All proposed todos must use `pending` status because execution starts only after user approval.
+Do not mark any todo as `in_progress` or `completed` during planning.
+Do not update progress, claim execution work is underway, or treat `write_todos` as an execution log.
+Do not skip `write_todos`; the plan review flow requires a structured draft plan.
+"""
+
+PLANNER_TODO_TOOL_DESCRIPTION = """Submit the draft plan for user review.
+
+Every todo must be a concrete executable step and must have `pending` status.
+This tool is not for execution progress and must not be used to mark work as started or completed.
+"""
+
 EXECUTOR_SYSTEM_PROMPT = """You are executing an approved plan.
 Work on exactly the current todo item. Use tools as needed. Update todo status with `write_todos`.
 Return a concise result for the current item.
