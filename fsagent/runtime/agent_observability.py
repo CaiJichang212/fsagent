@@ -39,6 +39,49 @@ class AgentLogContext:
     todo_content: str | None = None
 
 
+class PlannerToolBoundaryMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
+    """Prevent the planner from executing anything except writing the draft plan."""
+
+    state_schema = RuntimeState
+
+    def __init__(self, *, on_event: ProgressCallback | None = None) -> None:
+        """Initialize the planner tool boundary."""
+        self._context = AgentLogContext(agent_mode="plan", phase="planner")
+        self._on_event = on_event
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        """Block non-planning tools before they can run."""
+        tool_name = str(request.tool_call.get("name") or getattr(request.tool, "name", "unknown"))
+        if tool_name == "write_todos":
+            return await handler(request)
+
+        error = PermissionError("Planner is only allowed to call write_todos before plan review.")
+        args = request.tool_call.get("args")
+        await _emit_async(
+            self._on_event,
+            _event_payload(
+                context=self._context,
+                kind="agent.tool.failed",
+                message=f"planner 禁止调用工具 {tool_name}: {error}",
+                state=request.state,
+                fields={
+                    "tool_name": tool_name,
+                    "tool_call_id": str(request.tool_call.get("id") or ""),
+                    "args_keys": _mapping_keys(args),
+                    "args_size_chars": _serialized_size(args),
+                    "duration_ms": 0.0,
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+            ),
+        )
+        raise error
+
+
 class AgentObservabilityMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
     """Emit summarized model and tool lifecycle events for an agent."""
 
