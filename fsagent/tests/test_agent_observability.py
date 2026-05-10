@@ -4,7 +4,11 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 
-from fsagent.runtime.agent_observability import AgentLogContext, AgentObservabilityMiddleware
+from fsagent.runtime.agent_observability import (
+    AgentLogContext,
+    AgentObservabilityMiddleware,
+    PlannerToolBoundaryMiddleware,
+)
 
 
 @tool
@@ -130,3 +134,25 @@ async def test_agent_observability_emits_failed_event_and_reraises():
     assert [event["kind"] for event in events] == ["agent.model.started", "agent.model.failed"]
     assert events[1]["error_type"] == "RuntimeError"
     assert events[1]["error"] == "provider failed"
+
+
+async def test_planner_tool_boundary_blocks_non_write_todos_tools():
+    events: list[dict[str, object]] = []
+    middleware = PlannerToolBoundaryMiddleware(on_event=events.append)
+    request = ToolCallRequest(
+        tool_call={"name": "read_file", "args": {"file_path": "secret.txt"}, "id": "call-1"},
+        tool=observed_tool,
+        state={"messages": []},
+        runtime=None,
+    )
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="should not run", tool_call_id="call-1")
+
+    with pytest.raises(PermissionError, match="Planner is only allowed to call write_todos"):
+        await middleware.awrap_tool_call(request, handler)
+
+    assert [event["kind"] for event in events] == ["agent.tool.failed"]
+    assert events[0]["phase"] == "planner"
+    assert events[0]["tool_name"] == "read_file"
+    assert events[0]["error_type"] == "PermissionError"

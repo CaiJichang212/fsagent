@@ -340,6 +340,51 @@ async def test_agent_progress_events_log_structured_metadata():
     assert progress_logs[0].duration_ms == 12.5
 
 
+async def test_planner_capability_warning_enters_timeline_and_structured_log():
+    class CapabilityWarningRuntime(FakeRuntime):
+        async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+            self.calls.append((payload, config))
+            sink = (config.get("metadata") or {}).get("fsagent_event_sink")
+            await sink(
+                {
+                    "kind": "planner.capability_warning",
+                    "message": "Caller-provided executor tools truncated to 20 items; +1 more omitted.",
+                    "warning": "Caller-provided executor tools truncated to 20 items; +1 more omitted.",
+                }
+            )
+            return self.outputs.pop(0)
+
+    runtime = CapabilityWarningRuntime([{"final_response": "ok"}])
+    service = _service(runtime)
+    records: list[logging.LogRecord] = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    service_logger = logging.getLogger("fsagent.api.service")
+    previous_handlers = list(service_logger.handlers)
+    previous_propagate = service_logger.propagate
+    previous_level = service_logger.level
+    service_logger.handlers = [ListHandler()]
+    service_logger.propagate = False
+    service_logger.setLevel(logging.INFO)
+    try:
+        snapshots = [session async for session in service.create_run_stream(RunRequest(**_run_payload(mode="plan")))]
+    finally:
+        service_logger.handlers = previous_handlers
+        service_logger.propagate = previous_propagate
+        service_logger.setLevel(previous_level)
+
+    assert snapshots[-1].status == "completed"
+    warning_events = [event for event in snapshots[-1].timeline if event.kind == "planner.capability_warning"]
+    assert len(warning_events) == 1
+    assert warning_events[0].message == "Caller-provided executor tools truncated to 20 items; +1 more omitted."
+    progress_logs = [record for record in records if getattr(record, "event", None) == "planner.capability_warning"]
+    assert len(progress_logs) == 1
+    assert progress_logs[0].warning == "Caller-provided executor tools truncated to 20 items; +1 more omitted."
+
+
 def test_stream_review_plan_sends_incremental_session_events():
     interrupt = SimpleNamespace(
         value={
