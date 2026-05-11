@@ -875,6 +875,48 @@ class PartialToolUpdateRuntime(FakeRuntime):
         return self.outputs.pop(0)
 
 
+class AgentToolLifecycleRuntime(FakeRuntime):
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        sink = (config.get("metadata") or {}).get("fsagent_event_sink")
+        if sink is not None:
+            await sink(
+                {
+                    "kind": "tool.policy_decision",
+                    "message": "Tool policy review: execute",
+                    "tool_calls": [
+                        {
+                            "id": "call-execute",
+                            "name": "execute",
+                            "risk": "high",
+                            "status": "review_required",
+                            "inputSummary": '{"command": "pytest"}',
+                            "reviewId": "review-001",
+                        }
+                    ],
+                }
+            )
+            await sink(
+                {
+                    "kind": "agent.tool.started",
+                    "message": "execute started",
+                    "tool_name": "execute",
+                    "tool_call_id": "call-execute",
+                }
+            )
+            await sink(
+                {
+                    "kind": "agent.tool.completed",
+                    "message": "execute completed",
+                    "tool_name": "execute",
+                    "tool_call_id": "call-execute",
+                    "duration_ms": 12.5,
+                    "result_size_chars": 18,
+                }
+            )
+        return self.outputs.pop(0)
+
+
 def test_tool_progress_events_append_tool_calls_instead_of_replacing_history():
     runtime = ToolEventRuntime([{"final_response": "ok"}])
     service = _service(runtime)
@@ -907,6 +949,30 @@ def test_tool_progress_partial_updates_preserve_existing_audit_fields():
             "outputSummary": "pytest passed",
             "reviewId": None,
             "durationMs": None,
+        }
+    ]
+
+
+def test_agent_tool_lifecycle_events_update_existing_tool_call_status():
+    runtime = AgentToolLifecycleRuntime([{"final_response": "ok"}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="fast"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["toolCalls"] == [
+        {
+            "id": "call-execute",
+            "todoId": None,
+            "name": "execute",
+            "risk": "high",
+            "status": "completed",
+            "inputSummary": '{"command": "pytest"}',
+            "outputSummary": "result_size_chars=18",
+            "reviewId": "review-001",
+            "durationMs": 12.5,
         }
     ]
 

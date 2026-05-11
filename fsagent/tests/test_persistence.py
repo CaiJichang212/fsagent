@@ -1,5 +1,6 @@
 from fsagent.api.persistence import InMemorySessionStore, JsonlSessionStore, SessionStoreRecord
 from fsagent.api.schemas import SessionResponse, TimelineEvent, TodoItem
+from fsagent.api.server import _session_store_from_env
 
 
 def _session(status: str = "awaiting_plan_review") -> SessionResponse:
@@ -67,3 +68,20 @@ def test_jsonl_session_store_ignores_truncated_final_line(tmp_path):
 
     assert reloaded.get("session-1").session.status == "awaiting_plan_review"
     assert reloaded.get("session-1").runtime_config == {"thread_id": "thread-1"}
+
+
+def test_session_store_from_env_uses_jsonl_store_when_path_is_configured(tmp_path):
+    path = tmp_path / "sessions.jsonl"
+
+    store = _session_store_from_env({"FSAGENT_SESSION_STORE_PATH": str(path)})
+
+    record = SessionStoreRecord(session=_session(), runtime_config={"thread_id": "thread-1"}, checkpoint_ref="memory")
+    store.create(record)
+    reloaded = JsonlSessionStore(path)
+    assert reloaded.get("session-1").session.status == "awaiting_plan_review"
+
+
+def test_session_store_from_env_defaults_to_in_memory_store():
+    store = _session_store_from_env({})
+
+    assert isinstance(store, InMemorySessionStore)
