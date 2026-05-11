@@ -117,7 +117,7 @@ async def load_runtime_mcp_tools(
             await AsyncPath(prepared.temporary_path).unlink(missing_ok=True)
 
     return RuntimeMCPResult(
-        tools=_make_mcp_tool_errors_nonfatal(tools),
+        tools=_make_mcp_tool_errors_nonfatal(tools, trust_project_mcp=trust_project_mcp),
         client=manager,
         server_infos=list(server_infos),
     )
@@ -303,19 +303,21 @@ def _string_value(value: object) -> str | None:
     return normalized or None
 
 
-def _make_mcp_tool_errors_nonfatal(tools: list[BaseTool]) -> list[BaseTool]:
-    return [_make_mcp_tool_error_nonfatal(tool) for tool in tools]
+def _make_mcp_tool_errors_nonfatal(tools: list[BaseTool], *, trust_project_mcp: bool | None) -> list[BaseTool]:
+    return [_make_mcp_tool_error_nonfatal(tool, trust_project_mcp=trust_project_mcp) for tool in tools]
 
 
-def _make_mcp_tool_error_nonfatal(tool: BaseTool) -> BaseTool:
+def _make_mcp_tool_error_nonfatal(tool: BaseTool, *, trust_project_mcp: bool | None) -> BaseTool:
     async def invoke_mcp_tool(**kwargs: object) -> object:
         try:
             return await tool.ainvoke(kwargs)
         except Exception as exc:  # noqa: BLE001  # external MCP tool failures should be visible to the model
             return _format_mcp_tool_error(tool.name, exc)
 
+    metadata = _mcp_tool_metadata(tool, trust_project_mcp=trust_project_mcp)
     if tool.args_schema is None:
         tool.handle_tool_error = _make_mcp_tool_error_formatter(tool.name)
+        tool.metadata = metadata
         return tool
 
     return StructuredTool.from_function(
@@ -324,9 +326,16 @@ def _make_mcp_tool_error_nonfatal(tool: BaseTool) -> BaseTool:
         description=tool.description,
         args_schema=tool.args_schema,
         infer_schema=False,
-        metadata=tool.metadata,
+        metadata=metadata,
         tags=tool.tags,
     )
+
+
+def _mcp_tool_metadata(tool: BaseTool, *, trust_project_mcp: bool | None) -> dict[str, object]:
+    metadata = dict(tool.metadata or {})
+    metadata.setdefault("fsagent_tool_source", "mcp")
+    metadata.setdefault("fsagent_tool_risk", "high" if trust_project_mcp else "medium")
+    return metadata
 
 
 def _make_mcp_tool_error_formatter(tool: str) -> Callable[[Exception], str]:
