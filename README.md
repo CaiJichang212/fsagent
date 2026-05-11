@@ -6,8 +6,11 @@
 
 - **Fast 模式**：直接调用 Deep Agents 风格 agent，适合一次性快速任务。
 - **Plan 模式**：先生成 todo 计划，等待用户审核后再逐项执行，并输出执行摘要。
-- **计划审核**：支持批准、编辑、重试和取消计划。
-- **HTTP API + SSE**：前端可通过普通请求或事件流获取 session、timeline、todo 和执行日志。
+- **通用审核模型**：计划审核兼容旧 `/review` 端点；工具、偏离计划和 MCP 审核共用 `pendingReview` / `reviews` contract。
+- **Session Store**：默认使用内存 store，提供 JSONL store 作为本地恢复适配；服务重启后可查询 snapshot，恢复执行仍需要可用 runtime checkpoint。
+- **工具策略**：内置 `dev-default`、`locked-down`、`ci-eval` profile，高风险工具进入审核，未知工具默认拒绝。
+- **验证与证据报告**：Todo、执行日志、证据、产物、工具调用和 verification 都有稳定 ID，最终报告包含验证结果或跳过原因。
+- **HTTP API + SSE**：前端可通过普通请求或事件流获取 session、timeline、todo、review、tool call、evidence 和执行日志。
 - **模型配置**：通过 `.env` 和 `model_config.json` 管理模型、thinking 开关和采样参数。
 - **MCP 工具加载**：默认安全关闭；只有显式启用并信任项目 MCP 时才会加载 stdio MCP server。
 
@@ -71,6 +74,7 @@ MODEL=Qwen/Qwen3.5-27B
 BASE_URL=https://api-inference.modelscope.cn/v1
 API_KEY=xxx
 AVAILABLE_MODELS_JSON=model_config.json
+FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
 ```
 
 说明：
@@ -79,6 +83,7 @@ AVAILABLE_MODELS_JSON=model_config.json
 - `BASE_URL`：OpenAI-compatible 模型服务地址。
 - `API_KEY`：模型服务密钥；不要提交真实值。
 - `AVAILABLE_MODELS_JSON`：模型目录配置，默认读取项目根目录的 `model_config.json`。
+- `FSAGENT_SESSION_STORE_PATH`：可选。设置后 API 使用 JSONL session store 保存 snapshot；未设置时使用内存 store。
 
 ## 运行方式
 
@@ -137,6 +142,8 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
 | `GET` | `/api/runs/{sessionId}` | 获取已有 session |
 | `POST` | `/api/runs/{sessionId}/review` | 审核 Plan run |
 | `POST` | `/api/runs/{sessionId}/review/stream` | 审核 Plan run，并通过 SSE 返回增量快照 |
+| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision` | 提交通用 review 决策 |
+| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision/stream` | 提交通用 review 决策，并通过 SSE 返回增量快照 |
 
 创建 run 的请求示例：
 
@@ -148,7 +155,8 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
   "thinking": false,
   "mcpEnabled": false,
   "trustProjectMcp": false,
-  "mcpConfigPath": "mcp.json"
+  "mcpConfigPath": "mcp.json",
+  "toolPolicyProfile": "dev-default"
 }
 ```
 
@@ -167,12 +175,23 @@ Plan 审核请求示例：
 - `retry`：带 `feedback` 重新生成计划。
 - `cancel`：取消 session，可带 `reason`。
 
+通用 review 决策请求示例：
+
+```json
+{
+  "reviewId": "review-001",
+  "action": "approve"
+}
+```
+
+Plan review 支持 `approve`、`edit`、`retry`、`cancel`；tool review 支持 `approve`、`modify`、`deny`、`cancel`；deviation review 支持 `approve`、`replan`、`cancel`；MCP review 支持 `approve`、`deny`、`cancel`。旧 `/review` 端点仍作为 plan-review shorthand 保留。
+
 ## Runtime 工作流
 
 ```text
 用户输入
   ├── Fast 模式 -> fast_runner -> final_response
-  └── Plan 模式 -> planner -> plan_review -> executor -> formatter -> final_response
+  └── Plan 模式 -> planner -> plan_review -> executor -> verifier -> formatter -> final_response
 ```
 
 Plan 模式的最终报告包含：
@@ -181,6 +200,29 @@ Plan 模式的最终报告包含：
 - `Execution Summary`
 - `Plan Status`
 - `Artifacts And Evidence`
+- `Evidence`
+- `Verification`
+
+`completed` 只应在 verification 通过，或记录了明确的 skipped/manual verification reason 后出现。verification 失败时 session 可进入 `needs_revision`。
+
+## Session 与持久化
+
+API snapshot 包含 `pendingReview`、`reviews`、`toolCalls`、`artifacts`、`evidence` 和 `verification`。未设置 `FSAGENT_SESSION_STORE_PATH` 时，`InMemorySessionStore` 保持默认行为；设置该路径后，API 使用 `JsonlSessionStore` 本地保存和重载 session snapshot。注意：JSONL store 只保存 API snapshot 和 resume metadata，不保存 LangGraph runtime/checkpoint 本体；如果服务重启后缺少 runtime checkpoint，`GET /api/runs/{sessionId}` 仍可返回 snapshot，但 review/resume 会返回 `409 Runtime checkpoint missing for session.`。
+
+## 默认工具策略
+
+默认 profile 为 `dev-default`：
+
+| 工具类型 | 风险 | 默认行为 |
+| --- | --- | --- |
+| `ls`、`glob`、`grep`、`read_file` | low | 允许并记录摘要 |
+| `write_file`、`edit_file` | medium | 仅在 executor 阶段允许 |
+| `execute`、`bash`、`shell` | high | 进入 tool review |
+| `task` | medium | executor 阶段允许并记录摘要 |
+| MCP 工具 | medium/high | MCP 启用后按 metadata 和 profile 处理 |
+| Unknown tools | high | 默认拒绝 |
+
+`locked-down` 只直接允许只读工具，其余写入、执行、MCP、subtask 工具需要 review 或被拒绝；`ci-eval` 只允许确定性的只读工具，拒绝有副作用的工具。
 
 ## MCP 安全说明
 
