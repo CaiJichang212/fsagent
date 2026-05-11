@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -10,15 +11,23 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from fsagent.api.persistence import InMemorySessionStore, JsonlSessionStore, SessionStore
 from fsagent.api.schemas import (
     HealthResponse,
     ModelConfigItem,
     ModelConfigResponse,
+    ReviewDecisionRequest,
     ReviewRequest,
     RunRequest,
     SessionResponse,
 )
-from fsagent.api.service import FsAgentApiService, SessionNotFoundError
+from fsagent.api.service import (
+    CheckpointMissingError,
+    FsAgentApiService,
+    ReviewConflictError,
+    ReviewNotFoundError,
+    SessionNotFoundError,
+)
 from fsagent.observability import configure_logging, get_logger
 from fsagent.runtime.model_config import FsAgentEnv, load_model_catalog
 
@@ -28,12 +37,13 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 logger = get_logger(__name__)
+SESSION_STORE_PATH_ENV = "FSAGENT_SESSION_STORE_PATH"
 
 
-def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C901
+def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C901, PLR0915
     """Create the HTTP API app."""
     configure_logging()
-    resolved_service = service or FsAgentApiService()
+    resolved_service = service or FsAgentApiService(session_store=_session_store_from_env())
     app = FastAPI(title="fsagent API")
     app.middleware("http")(_log_http_request)
 
@@ -70,6 +80,12 @@ def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C9
             return await resolved_service.review_plan(session_id, request)
         except SessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except CheckpointMissingError as exc:
+            raise HTTPException(status_code=409, detail="Runtime checkpoint missing for session.") from exc
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Review not found.") from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{session_id}/review/stream")
     async def review_plan_stream(session_id: str, request: ReviewRequest) -> StreamingResponse:
@@ -78,9 +94,60 @@ def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C9
             stream = resolved_service.review_plan_stream(session_id, request)
         except SessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except CheckpointMissingError as exc:
+            raise HTTPException(status_code=409, detail="Runtime checkpoint missing for session.") from exc
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Review not found.") from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return StreamingResponse(_session_sse(stream), media_type="text/event-stream")
+
+    @app.post(
+        "/api/runs/{session_id}/reviews/{review_id}/decision",
+        response_model=SessionResponse,
+        response_model_by_alias=True,
+    )
+    async def decide_review(session_id: str, review_id: str, request: ReviewDecisionRequest) -> SessionResponse:
+        try:
+            return await resolved_service.decide_review(session_id, review_id, request)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except CheckpointMissingError as exc:
+            raise HTTPException(status_code=409, detail="Runtime checkpoint missing for session.") from exc
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Review not found.") from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{session_id}/reviews/{review_id}/decision/stream")
+    async def decide_review_stream(
+        session_id: str,
+        review_id: str,
+        request: ReviewDecisionRequest,
+    ) -> StreamingResponse:
+        try:
+            await resolved_service.get_run(session_id)
+            stream = resolved_service.decide_review_stream(session_id, review_id, request)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except CheckpointMissingError as exc:
+            raise HTTPException(status_code=409, detail="Runtime checkpoint missing for session.") from exc
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Review not found.") from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StreamingResponse(_session_sse(stream), media_type="text/event-stream")
 
     return app
+
+
+def _session_store_from_env(env: dict[str, str] | None = None) -> SessionStore:
+    """Create the configured session store for server startup."""
+    values = os.environ if env is None else env
+    path = values.get(SESSION_STORE_PATH_ENV, "").strip()
+    if path:
+        return JsonlSessionStore(path)
+    return InMemorySessionStore()
 
 
 async def _log_http_request(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
