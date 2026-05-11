@@ -219,6 +219,7 @@ export function TaskComposer({ onSubmit, models = [], defaultMode = "fast", comp
           className="h-8 w-8 rounded-full"
           onClick={submit}
           disabled={!canSubmit}
+          aria-label={mode === "fast" ? "提交 Fast 任务" : "提交 Plan 任务"}
           title={mode === "fast" ? "快速运行 (⌘/Ctrl+Enter)" : "生成计划 (⌘/Ctrl+Enter)"}
         >
           <ArrowUp className="w-4 h-4" />
