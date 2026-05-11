@@ -29,9 +29,9 @@ async def test_execute_plan_records_precompleted_items_as_skipped():
 
     assert len(agent.messages) == 1
     assert "待执行事项" in agent.messages[0]
-    assert result.todos == [
-        {"content": "已完成事项", "status": "completed"},
-        {"content": "待执行事项", "status": "completed"},
+    assert [(todo["content"], todo["status"]) for todo in result.todos] == [
+        ("已完成事项", "completed"),
+        ("待执行事项", "completed"),
     ]
     assert result.execution_log[0]["content"] == "已完成事项"
     assert result.execution_log[0]["status"] == "skipped"
@@ -52,9 +52,12 @@ async def test_execute_plan_emits_progress_events():
     )
 
     assert events[0]["kind"] == "todo.started"
-    assert events[0]["todos"] == [{"content": "运行联调", "status": "in_progress"}]
+    assert events[0]["todos"][0]["content"] == "运行联调"
+    assert events[0]["todos"][0]["status"] == "in_progress"
     assert events[1]["kind"] == "todo.completed"
-    assert events[1]["execution_log"] == [{"content": "运行联调", "status": "completed", "result": "done"}]
+    assert events[1]["execution_log"][0]["content"] == "运行联调"
+    assert events[1]["execution_log"][0]["status"] == "completed"
+    assert events[1]["execution_log"][0]["result"] == "done"
 
 
 async def test_execute_plan_invokes_agent_with_only_current_todo_state():
@@ -68,9 +71,9 @@ async def test_execute_plan_invokes_agent_with_only_current_todo_state():
         ],
     )
 
-    assert [state["todos"] for state in agent.states] == [
-        [{"content": "第一项", "status": "in_progress"}],
-        [{"content": "第二项", "status": "in_progress"}],
+    assert [[(todo["content"], todo["status"]) for todo in state["todos"]] for state in agent.states] == [
+        [("第一项", "in_progress")],
+        [("第二项", "in_progress")],
     ]
     assert [(state["fsagent_todo_index"], state["fsagent_todo_content"]) for state in agent.states] == [
         (1, "第一项"),
@@ -97,3 +100,28 @@ async def test_execute_plan_uses_separate_thread_id_per_todo():
         "run-thread:todo:2",
     ]
     assert [config["metadata"] for config in agent.configs] == [{"trace": "yes"}, {"trace": "yes"}]
+
+
+async def test_execute_plan_links_todo_execution_log_and_evidence_ids():
+    agent = RecordingAgent()
+
+    result = await execute_plan(
+        agent=agent,
+        todos=[{"content": "运行测试", "status": "pending"}],
+    )
+
+    assert result.todos[0]["id"] == "todo-001"
+    assert result.todos[0]["evidence_ids"] == ["evidence-001"]
+    assert result.execution_log[0]["id"] == "log-001"
+    assert result.execution_log[0]["todo_id"] == "todo-001"
+    assert result.evidence == [
+        {
+            "id": "evidence-001",
+            "todo_id": "todo-001",
+            "tool_call_id": None,
+            "artifact_id": None,
+            "summary": "done",
+            "source": "runtime",
+            "created_at": None,
+        }
+    ]

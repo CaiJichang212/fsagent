@@ -1,5 +1,6 @@
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -425,6 +426,134 @@ async def test_plan_planner_does_not_load_mcp_tools_before_review(monkeypatch):
     )
 
     assert "__interrupt__" in result
+
+
+async def test_fast_mode_high_risk_tool_uses_hitl_interrupt():
+    @tool
+    def execute(command: str) -> str:
+        """Run a local command."""
+        return f"ran {command}"
+
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "execute",
+                            "args": {"command": "pytest"},
+                            "id": "call-execute",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, tools=[execute], no_mcp=True, checkpointer=InMemorySaver())
+
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="run tests")]},
+        config={"configurable": {"thread_id": "fast-hitl-thread"}},
+    )
+
+    assert "__interrupt__" in result
+    interrupt = result["__interrupt__"][0].value
+    assert interrupt["action_requests"][0]["name"] == "execute"
+    assert interrupt["review_configs"][0]["allowed_decisions"] == ["approve", "edit", "reject"]
+
+
+async def test_fast_mode_write_tool_uses_hitl_interrupt():
+    @tool
+    def write_file(path: str, content: str) -> str:
+        """Write a local file."""
+        return f"wrote {path}: {content}"
+
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_file",
+                            "args": {"path": "out.txt", "content": "ok"},
+                            "id": "call-write",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, tools=[write_file], no_mcp=True, checkpointer=InMemorySaver())
+
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="write a file")]},
+        config={"configurable": {"thread_id": "fast-write-hitl-thread"}},
+    )
+
+    assert "__interrupt__" in result
+    interrupt = result["__interrupt__"][0].value
+    assert interrupt["action_requests"][0]["name"] == "write_file"
+    assert interrupt["review_configs"][0]["allowed_decisions"] == ["approve", "edit", "reject"]
+
+
+async def test_plan_executor_delegates_hitl_installation_to_deep_agent(monkeypatch):
+    @tool
+    def execute(command: str) -> str:
+        """Run a local command."""
+        return f"ran {command}"
+
+    captured: dict[str, Any] = {}
+
+    class SentinelHumanInTheLoopMiddleware:
+        def __init__(self, interrupt_on: dict[str, object]) -> None:
+            self.interrupt_on = interrupt_on
+
+    def fake_create_deep_agent(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    async def fake_execute_plan(**kwargs: object) -> object:
+        return SimpleNamespace(
+            todos=kwargs["todos"],
+            execution_log=[],
+            evidence=[],
+            final_result="executor done",
+        )
+
+    monkeypatch.setattr("fsagent.runtime.graph.HumanInTheLoopMiddleware", SentinelHumanInTheLoopMiddleware)
+    monkeypatch.setattr("fsagent.runtime.graph.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("fsagent.runtime.graph.execute_plan", fake_execute_plan)
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, tools=[execute], no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "executor-hitl-installation-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert "__interrupt__" in first_result
+    assert "executor done" in final_result["final_response"]
+    assert captured["interrupt_on"] == {"execute": {"allowed_decisions": ["approve", "edit", "reject"]}}
+    assert all(not isinstance(middleware, SentinelHumanInTheLoopMiddleware) for middleware in captured["middleware"])
 
 
 class _ToolBindingFakeChatModel(BaseChatModel):

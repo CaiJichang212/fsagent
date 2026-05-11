@@ -156,6 +156,8 @@ async def test_load_runtime_mcp_tools_returns_tool_errors_to_model(monkeypatch, 
 
     result = await load_runtime_mcp_tools(str(config))
 
+    assert result.tools[0].metadata["fsagent_tool_source"] == "mcp"
+    assert result.tools[0].metadata["fsagent_tool_risk"] == "medium"
     output = await result.tools[0].ainvoke({})
     assert "forbidden_tool" in output
     assert "403" in output
