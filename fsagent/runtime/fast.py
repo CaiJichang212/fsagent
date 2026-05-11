@@ -14,7 +14,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
-from langgraph.types import Command
+from langgraph.store.base import BaseStore
+from langgraph.types import Checkpointer, Command
 
 from fsagent.runtime.agent_observability import (
     AgentLogContext,
@@ -122,6 +123,8 @@ def create_fast_agent(
     tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
     system_prompt: str | None = None,
     middleware: Sequence[AgentMiddleware[RuntimeState, Any, Any]] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
     on_event: ProgressCallback | None = None,
 ) -> object:
     """Create a fast-mode agent without `TodoListMiddleware`.
@@ -131,6 +134,8 @@ def create_fast_agent(
         tools: Tools available during the single permitted tool round.
         system_prompt: Optional caller prompt layered before the fast prompt.
         middleware: Additional agent middleware to install before the fast tool limiter.
+        checkpointer: Optional checkpointer for HITL tool approvals.
+        store: Optional LangGraph store.
         on_event: Optional progress callback for fast tool limiter events.
 
     Returns:
@@ -148,6 +153,8 @@ def create_fast_agent(
                 on_event=on_event,
             ),
         ],
+        checkpointer=checkpointer,
+        store=store,
     )
 
 
