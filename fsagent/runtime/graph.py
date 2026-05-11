@@ -1,13 +1,19 @@
 """LangGraph assembly for the explicit fast/plan runtime."""
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from threading import RLock
 from typing import Any
 
 from deepagents import create_deep_agent
+from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
+from deepagents.profiles.harness import HarnessProfile, register_harness_profile
+from deepagents.profiles.harness.harness_profiles import _HARNESS_PROFILES, _ensure_harness_profiles_loaded
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
+from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
@@ -37,6 +43,33 @@ from fsagent.runtime.state import RuntimeState
 from fsagent.runtime.verifier import verify_execution
 
 ProgressCallback = Callable[[Mapping[str, object]], Awaitable[None]]
+_HARNESS_PROFILE_LOCK = RLock()
+
+
+class ExecutorTodoToolGuardMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
+    """Convert unexpected executor `write_todos` calls into model-visible errors."""
+
+    state_schema = RuntimeState
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage],
+    ) -> ToolMessage:
+        """Handle unexpected synchronous executor todo tool calls."""
+        if _tool_call_name(request) == "write_todos":
+            return _executor_write_todos_error(request)
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage]],
+    ) -> ToolMessage:
+        """Handle unexpected asynchronous executor todo tool calls."""
+        if _tool_call_name(request) == "write_todos":
+            return _executor_write_todos_error(request)
+        return await handler(request)
 
 
 def create_runtime(  # noqa: C901, PLR0915
@@ -209,6 +242,7 @@ def create_runtime(  # noqa: C901, PLR0915
             base=interrupt_on,
         )
         middleware = [
+            ExecutorTodoToolGuardMiddleware(),
             ToolPolicyMiddleware(
                 profile=tool_policy_profile,
                 phase="executor",
@@ -219,18 +253,19 @@ def create_runtime(  # noqa: C901, PLR0915
                 on_event=on_event,
             ),
         ]
-        agent = create_deep_agent(
-            model=model,
-            tools=executor_tools,
-            system_prompt=_join_prompts(system_prompt, EXECUTOR_SYSTEM_PROMPT),
-            middleware=middleware,
-            skills=skills,
-            memory=memory,
-            backend=backend,
-            interrupt_on=policy_interrupt_on or None,
-            checkpointer=checkpointer,
-            store=store,
-        )
+        with _executor_todo_middleware_excluded(model):
+            agent = create_deep_agent(
+                model=model,
+                tools=executor_tools,
+                system_prompt=_join_prompts(system_prompt, EXECUTOR_SYSTEM_PROMPT),
+                middleware=middleware,
+                skills=skills,
+                memory=memory,
+                backend=backend,
+                interrupt_on=policy_interrupt_on or None,
+                checkpointer=checkpointer,
+                store=store,
+            )
         await emit_agent_event(
             on_event,
             AgentLogContext(agent_mode="plan", phase="executor"),
@@ -310,6 +345,55 @@ def _last_user_content(state: RuntimeState) -> str:
         raise ValueError(msg)
     content = getattr(messages[-1], "content", "")
     return str(content)
+
+
+def _tool_call_name(request: ToolCallRequest) -> str | None:
+    name = request.tool_call.get("name") or getattr(request.tool, "name", None)
+    return str(name) if name is not None else None
+
+
+def _executor_write_todos_error(request: ToolCallRequest) -> ToolMessage:
+    return ToolMessage(
+        content=(
+            "The write_todos tool is not available during approved plan execution. "
+            "Complete the current item and return result evidence; the fsagent runtime updates todo status."
+        ),
+        tool_call_id=str(request.tool_call.get("id") or ""),
+        status="error",
+    )
+
+
+@contextmanager
+def _executor_todo_middleware_excluded(model: str | BaseChatModel) -> Iterator[None]:
+    profile_key = _executor_harness_profile_key(model)
+    if profile_key is None:
+        yield
+        return
+
+    with _HARNESS_PROFILE_LOCK:
+        _ensure_harness_profiles_loaded()
+        original_profiles = dict(_HARNESS_PROFILES)
+        try:
+            register_harness_profile(
+                profile_key,
+                HarnessProfile(excluded_middleware=frozenset({"TodoListMiddleware"})),
+            )
+            yield
+        finally:
+            _HARNESS_PROFILES.clear()
+            _HARNESS_PROFILES.update(original_profiles)
+
+
+def _executor_harness_profile_key(model: str | BaseChatModel) -> str | None:
+    if isinstance(model, str):
+        return model
+    identifier = get_model_identifier(model)
+    provider = get_model_provider(model)
+    if provider and identifier and ":" not in identifier:
+        return f"{provider}:{identifier}"
+    if identifier is not None and ":" in identifier:
+        return identifier
+    return provider
 
 
 def _system_prompt_text(system_prompt: str | SystemMessage | None) -> str | None:
