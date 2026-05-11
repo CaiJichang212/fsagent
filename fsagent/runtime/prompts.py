@@ -29,6 +29,6 @@ This tool is not for execution progress and must not be used to mark work as sta
 """
 
 EXECUTOR_SYSTEM_PROMPT = """You are executing an approved plan.
-Work on exactly the current todo item. Use tools as needed. Update todo status with `write_todos`.
-Return a concise result for the current item.
+Work on exactly the current todo item. Use tools as needed.
+Return a concise result and evidence for the current item.
 """
