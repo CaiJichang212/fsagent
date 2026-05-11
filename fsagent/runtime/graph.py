@@ -28,16 +28,18 @@ from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path
 from fsagent.runtime.planner import generate_plan
 from fsagent.runtime.planner_agent import create_planner_agent
 from fsagent.runtime.planner_capabilities import PlannerCapabilitySummaryBuilder
+from fsagent.runtime.policy import ToolPolicyMiddleware, policy_interrupt_on_for_tools
 from fsagent.runtime.prompts import (
     EXECUTOR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
 from fsagent.runtime.state import RuntimeState
+from fsagent.runtime.verifier import verify_execution
 
 ProgressCallback = Callable[[Mapping[str, object]], Awaitable[None]]
 
 
-def create_runtime(  # noqa: C901
+def create_runtime(  # noqa: C901, PLR0915
     model: str | BaseChatModel,
     tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
     *,
@@ -51,6 +53,7 @@ def create_runtime(  # noqa: C901
     mcp_config_path: str | None = None,
     no_mcp: bool = False,
     trust_project_mcp: bool | None = None,
+    tool_policy_profile: str = "dev-default",
 ) -> CompiledStateGraph:
     """Create the explicit fast/plan runtime graph.
 
@@ -67,6 +70,7 @@ def create_runtime(  # noqa: C901
         mcp_config_path: Optional MCP config path.
         no_mcp: Disable MCP loading.
         trust_project_mcp: Whether project-level stdio MCP servers are trusted.
+        tool_policy_profile: fsagent tool policy profile.
 
     Returns:
         Compiled runtime graph.
@@ -96,16 +100,33 @@ def create_runtime(  # noqa: C901
 
     async def fast_runner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         on_event = _progress_callback(config)
+        fast_tools = await combined_tools()
+        policy_interrupt_on = policy_interrupt_on_for_tools(
+            fast_tools,
+            profile=tool_policy_profile,
+            phase="fast_runner",
+            base=interrupt_on,
+        )
+        middleware = [
+            ToolPolicyMiddleware(
+                profile=tool_policy_profile,
+                phase="fast_runner",
+                on_event=on_event,
+            ),
+            AgentObservabilityMiddleware(
+                context=AgentLogContext(agent_mode="fast", phase="fast_runner"),
+                on_event=on_event,
+            ),
+        ]
+        if policy_interrupt_on:
+            middleware.append(HumanInTheLoopMiddleware(policy_interrupt_on))
         agent = create_fast_agent(
             model=model,
-            tools=await combined_tools(),
+            tools=fast_tools,
             system_prompt=_system_prompt_text(system_prompt),
-            middleware=[
-                AgentObservabilityMiddleware(
-                    context=AgentLogContext(agent_mode="fast", phase="fast_runner"),
-                    on_event=on_event,
-                )
-            ],
+            middleware=middleware,
+            checkpointer=checkpointer,
+            store=store,
             on_event=on_event,
         )
         content = _last_user_content(state)
@@ -180,23 +201,33 @@ def create_runtime(  # noqa: C901
 
     async def executor(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         on_event = _progress_callback(config)
+        executor_tools = await combined_tools()
+        policy_interrupt_on = policy_interrupt_on_for_tools(
+            executor_tools,
+            profile=tool_policy_profile,
+            phase="executor",
+            base=interrupt_on,
+        )
         middleware = [
+            ToolPolicyMiddleware(
+                profile=tool_policy_profile,
+                phase="executor",
+                on_event=on_event,
+            ),
             AgentObservabilityMiddleware(
                 context=AgentLogContext(agent_mode="plan", phase="executor"),
                 on_event=on_event,
-            )
+            ),
         ]
-        if interrupt_on is not None:
-            middleware.append(HumanInTheLoopMiddleware(interrupt_on))
         agent = create_deep_agent(
             model=model,
-            tools=await combined_tools(),
+            tools=executor_tools,
             system_prompt=_join_prompts(system_prompt, EXECUTOR_SYSTEM_PROMPT),
             middleware=middleware,
             skills=skills,
             memory=memory,
             backend=backend,
-            interrupt_on=interrupt_on,
+            interrupt_on=policy_interrupt_on or None,
             checkpointer=checkpointer,
             store=store,
         )
@@ -222,7 +253,20 @@ def create_runtime(  # noqa: C901
             todo_count=len(result.todos),
             execution_log_count=len(result.execution_log),
         )
-        return {"todos": result.todos, "execution_log": result.execution_log, "final_response": result.final_result}
+        return {
+            "todos": result.todos,
+            "execution_log": result.execution_log,
+            "evidence": result.evidence,
+            "final_response": result.final_result,
+        }
+
+    def verifier(state: RuntimeState) -> dict[str, Any]:
+        result = verify_execution(
+            todos=state["todos"],
+            execution_log=state.get("execution_log", []),
+            verification=state.get("verification"),
+        )
+        return {"verification": result.verification, "status": result.status}
 
     def formatter(state: RuntimeState) -> dict[str, Any]:
         report = format_final_report(
@@ -230,6 +274,8 @@ def create_runtime(  # noqa: C901
             todos=state["todos"],
             execution_log=state.get("execution_log", []),
             artifacts=state.get("artifacts", []),
+            evidence=state.get("evidence", []),
+            verification=state.get("verification", []),
         )
         return {"final_response": report}
 
@@ -238,11 +284,13 @@ def create_runtime(  # noqa: C901
     graph.add_node("planner", planner)
     graph.add_node("plan_review", plan_review)
     graph.add_node("executor", executor)
+    graph.add_node("verifier", verifier)
     graph.add_node("formatter", formatter)
     graph.add_conditional_edges(START, _route_mode, {"fast": "fast_runner", "plan": "planner"})
     graph.add_edge("fast_runner", END)
     graph.add_edge("planner", "plan_review")
-    graph.add_edge("executor", "formatter")
+    graph.add_edge("executor", "verifier")
+    graph.add_edge("verifier", "formatter")
     graph.add_edge("formatter", END)
     return graph.compile(checkpointer=checkpointer, store=store)
 
