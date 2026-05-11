@@ -29,3 +29,4 @@ class RuntimeConfig:
     mcp_config_path: str | None = None
     no_mcp: bool = False
     trust_project_mcp: bool | None = None
+    tool_policy_profile: str = "dev-default"
