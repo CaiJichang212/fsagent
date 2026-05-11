@@ -19,18 +19,17 @@ import {
 } from "./components/ui/collapsible";
 import { SidebarSessions } from "./components/sidebar-sessions";
 import { TaskComposer, ComposerSubmit } from "./components/task-composer";
-import { PlanReviewPanel } from "./components/plan-review-panel";
 import { ExecutionView } from "./components/execution-view";
 import { ReportView } from "./components/report-view";
 import { MarkdownContent } from "./components/markdown-content";
 import { Timeline } from "./components/timeline";
+import { ReviewGate } from "./components/review-gate";
 import {
   FsAgentSession,
   ModelConfigItem,
-  PlanMeta,
-  TodoItem,
+  ReviewRecord,
 } from "./components/types";
-import { getModelConfig, streamCreateRun, streamReviewPlan, type ReviewPlanPayload } from "./api/fsagent-client";
+import { getModelConfig, streamCreateRun, streamDecideReview, type ReviewDecisionPayload } from "./api/fsagent-client";
 import { toast } from "sonner";
 
 const STATUS_LABEL: Record<FsAgentSession["status"], { label: string; tone: string }> = {
@@ -42,6 +41,8 @@ const STATUS_LABEL: Record<FsAgentSession["status"], { label: string; tone: stri
   retrying_plan: { label: "重试计划", tone: "text-amber-500" },
   executing: { label: "执行中", tone: "text-primary" },
   awaiting_tool_review: { label: "工具审批", tone: "text-amber-500" },
+  verifying: { label: "验证中", tone: "text-primary" },
+  needs_revision: { label: "需修订", tone: "text-amber-500" },
   completed: { label: "已完成", tone: "text-emerald-500" },
   cancelled: { label: "已取消", tone: "text-muted-foreground" },
   failed: { label: "失败", tone: "text-destructive" },
@@ -76,7 +77,7 @@ export default function App() {
       if (raw) {
         const data = JSON.parse(raw) as { sessions: FsAgentSession[]; activeId: string | null };
         const restored = data.sessions.map((s) =>
-          s.status === "running" || s.status === "planning" || s.status === "executing"
+          s.status === "running" || s.status === "planning" || s.status === "executing" || s.status === "verifying"
             ? { ...s, status: "failed" as const, error: "服务重启或断线，无法继续之前的运行。请重新提交任务。" }
             : s,
         );
@@ -137,34 +138,28 @@ export default function App() {
     }
   };
 
-  const submitReview = async (
+  const submitReviewDecision = async (
     id: string,
-    payload: ReviewPlanPayload,
+    review: ReviewRecord,
+    payload: ReviewDecisionPayload,
     pendingStatus: FsAgentSession["status"],
   ) => {
     markPending(id, pendingStatus);
     try {
-      await streamReviewPlan(id, payload, replaceSession);
+      await streamDecideReview(id, review.id, payload, replaceSession);
     } catch (error) {
       toast.error(toErrorMessage(error));
-      markPending(id, "awaiting_plan_review");
+      markPending(id, review.kind === "plan_review" ? "awaiting_plan_review" : "awaiting_tool_review");
     }
   };
 
-  const onApprove = (id: string) => {
-    void submitReview(id, { action: "approve" }, "executing");
-  };
-
-  const onEdit = (id: string, todos: TodoItem[], planMeta: PlanMeta) => {
-    void submitReview(id, { action: "edit", todos, planMeta }, "editing_plan");
-  };
-
-  const onRetry = (id: string, feedback: string) => {
-    void submitReview(id, { action: "retry", feedback }, "retrying_plan");
-  };
-
-  const onCancel = (id: string, reason: string) => {
-    void submitReview(id, { action: "cancel", reason }, "cancelled");
+  const onReviewDecision = (
+    id: string,
+    review: ReviewRecord,
+    payload: ReviewDecisionPayload,
+    pendingStatus: FsAgentSession["status"],
+  ) => {
+    void submitReviewDecision(id, review, payload, pendingStatus);
   };
 
   return (
@@ -217,11 +212,9 @@ export default function App() {
             ) : (
               <SessionView
                 session={active}
-                onSubmit={handleSubmit}
-                onApprove={() => onApprove(active.sessionId)}
-                onEdit={(t, m) => onEdit(active.sessionId, t, m)}
-                onRetry={(f) => onRetry(active.sessionId, f)}
-                onCancel={(r) => onCancel(active.sessionId, r)}
+                onReviewDecision={(review, payload, pendingStatus) =>
+                  onReviewDecision(active.sessionId, review, payload, pendingStatus)
+                }
               />
             )}
           </div>
@@ -315,24 +308,11 @@ function WelcomeScreen({ onSubmit, models }: { onSubmit: (v: ComposerSubmit) => 
 
 function SessionView({
   session,
-  onSubmit,
-  onApprove,
-  onEdit,
-  onRetry,
-  onCancel,
+  onReviewDecision,
 }: {
   session: FsAgentSession;
-  onSubmit: (v: ComposerSubmit) => void;
-  onApprove: () => void;
-  onEdit: (todos: TodoItem[], meta: PlanMeta) => void;
-  onRetry: (feedback: string) => void;
-  onCancel: (reason: string) => void;
+  onReviewDecision: (review: ReviewRecord, payload: ReviewDecisionPayload, pendingStatus: FsAgentSession["status"]) => void;
 }) {
-  const planLocked =
-    session.status === "executing" ||
-    session.status === "completed" ||
-    session.status === "cancelled";
-
   return (
     <div className="max-w-4xl mx-auto space-y-5">
       <div className="rounded-xl border border-border bg-card px-5 py-4">
@@ -347,17 +327,12 @@ function SessionView({
         </Alert>
       )}
 
-      {session.mode === "plan" && session.planMeta && (
-        <PlanReviewPanel
+      {session.pendingReview && (
+        <ReviewGate
+          review={session.pendingReview}
           todos={session.todos}
           planMeta={session.planMeta}
-          instructions="Review the plan above. Approve to execute all items."
-          allowedActions={["approve", "edit", "retry", "cancel"]}
-          onApprove={onApprove}
-          onEdit={onEdit}
-          onRetry={onRetry}
-          onCancel={onCancel}
-          locked={planLocked}
+          onDecision={onReviewDecision}
         />
       )}
 
