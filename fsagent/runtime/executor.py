@@ -188,8 +188,7 @@ def _execution_prompt(*, todo: TodoItem, index: int, total: int, plan_meta: Plan
         f"Goal: {goal}\n\n"
         f"Item: {index + 1} of {total}\n\n"
         f"Current todo: {todo['content']}\n\n"
-        "The todo state provided to you contains only this current item. "
-        "Use write_todos only to keep this single item synchronized."
+        "The runtime will update todo status, execution logs, and evidence after this run."
     )
 
 
