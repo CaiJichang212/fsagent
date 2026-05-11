@@ -1,4 +1,5 @@
 from fsagent.runtime.executor import execute_plan
+from fsagent.runtime.prompts import EXECUTOR_SYSTEM_PROMPT
 
 
 class RecordingAgent:
@@ -81,6 +82,23 @@ async def test_execute_plan_invokes_agent_with_only_current_todo_state():
     ]
     assert "第二项" not in agent.messages[0]
     assert "第一项" not in agent.messages[1]
+
+
+async def test_execute_plan_prompt_does_not_tell_executor_to_update_todos():
+    agent = RecordingAgent()
+
+    await execute_plan(
+        agent=agent,
+        todos=[{"content": "实现功能", "status": "pending"}],
+    )
+
+    assert "write_todos" not in agent.messages[0]
+    assert "todo state" not in agent.messages[0].lower()
+
+
+def test_executor_system_prompt_does_not_tell_executor_to_update_todos():
+    assert "write_todos" not in EXECUTOR_SYSTEM_PROMPT
+    assert "Update todo status" not in EXECUTOR_SYSTEM_PROMPT
 
 
 async def test_execute_plan_uses_separate_thread_id_per_todo():

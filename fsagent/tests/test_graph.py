@@ -556,6 +556,80 @@ async def test_plan_executor_delegates_hitl_installation_to_deep_agent(monkeypat
     assert all(not isinstance(middleware, SentinelHumanInTheLoopMiddleware) for middleware in captured["middleware"])
 
 
+async def test_plan_executor_does_not_expose_write_todos_to_model():
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+                AIMessage(content="检查完成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "executor-no-write-todos-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert "__interrupt__" in first_result
+    assert "检查完成" in final_result["final_response"]
+    assert "write_todos" not in [getattr(tool_item, "name", None) for tool_item in model.bound_tools]
+    executor_model_call = "\n".join(str(message.content) for message in model.call_messages[-1])
+    assert "## `write_todos`" not in executor_model_call
+    assert "You have access to the `write_todos` tool" not in executor_model_call
+
+
+async def test_plan_executor_ignores_unexpected_write_todos_tool_call():
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "执行项", "status": "pending"}]},
+                            "id": "planner-call",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "执行项", "status": "completed"}]},
+                            "id": "executor-call",
+                        }
+                    ],
+                ),
+                AIMessage(content="执行完成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "executor-unexpected-write-todos-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert "__interrupt__" in first_result
+    assert "Unknown tools are denied by default" not in final_result["final_response"]
+    assert final_result["todos"][0]["status"] == "completed"
+    assert final_result["execution_log"][0]["result"] == "执行完成"
+
+
 class _ToolBindingFakeChatModel(BaseChatModel):
     messages: Iterator[AIMessage | str] = Field(exclude=True)
     bound_tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool] = ()
