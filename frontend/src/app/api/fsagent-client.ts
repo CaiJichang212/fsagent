@@ -1,10 +1,18 @@
 import { ComposerSubmit } from "../components/task-composer";
-import { FsAgentSession, ModelConfigResponse, PlanMeta, TodoItem } from "../components/types";
+import { FsAgentSession, ModelConfigResponse, PlanMeta, ReviewAction, TodoItem } from "../components/types";
 
 export interface ReviewPlanPayload {
   action: "approve" | "edit" | "retry" | "cancel";
   todos?: TodoItem[];
   planMeta?: PlanMeta;
+  feedback?: string;
+  reason?: string;
+}
+
+export interface ReviewDecisionPayload {
+  action: ReviewAction;
+  reviewId?: string;
+  editedSubject?: Record<string, unknown>;
   feedback?: string;
   reason?: string;
 }
@@ -55,6 +63,22 @@ export async function streamReviewPlan(
     {
       method: "POST",
       body: JSON.stringify(payload),
+    },
+    onSession,
+  );
+}
+
+export async function streamDecideReview(
+  sessionId: string,
+  reviewId: string,
+  payload: ReviewDecisionPayload,
+  onSession: (session: FsAgentSession) => void,
+): Promise<FsAgentSession> {
+  return streamRequest<FsAgentSession>(
+    `/api/runs/${sessionId}/reviews/${reviewId}/decision/stream`,
+    {
+      method: "POST",
+      body: JSON.stringify({ reviewId, ...payload }),
     },
     onSession,
   );
