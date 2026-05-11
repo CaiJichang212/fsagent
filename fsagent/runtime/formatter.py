@@ -3,7 +3,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from fsagent.runtime.state import ExecutionLogEntry, TodoItem
+from fsagent.runtime.state import ArtifactRecord, EvidenceRecord, ExecutionLogEntry, TodoItem, VerificationRecord
 
 
 def _summary_lines(execution_log: Sequence[ExecutionLogEntry]) -> list[str]:
@@ -44,12 +44,37 @@ def _plan_status_line(todo: Mapping[str, Any], log_by_content: Mapping[str, Exec
     return f"- [ ] {content}"
 
 
+def _artifact_lines(artifacts: Sequence[str | ArtifactRecord] | None) -> list[str]:
+    lines: list[str] = []
+    for artifact in artifacts or []:
+        if isinstance(artifact, str):
+            lines.append(f"- {artifact}")
+        else:
+            summary = artifact.get("summary") or artifact.get("path") or artifact["id"]
+            lines.append(f"- {artifact['id']}: {summary}")
+    return lines or ["- No artifacts recorded."]
+
+
+def _evidence_lines(evidence: Sequence[EvidenceRecord] | None) -> list[str]:
+    return [f"- {item['id']}: {item['summary']}" for item in evidence or []] or ["- No evidence records."]
+
+
+def _verification_lines(verification: Sequence[VerificationRecord] | None) -> list[str]:
+    lines: list[str] = []
+    for item in verification or []:
+        detail = item.get("command") or item.get("reason") or "manual verification"
+        lines.append(f"- {item['id']}: {item['status']} - {detail}")
+    return lines or ["- No verification records."]
+
+
 def format_final_report(
     *,
     result: str,
     todos: Sequence[TodoItem],
     execution_log: Sequence[ExecutionLogEntry],
-    artifacts: Sequence[str] | None = None,
+    artifacts: Sequence[str | ArtifactRecord] | None = None,
+    evidence: Sequence[EvidenceRecord] | None = None,
+    verification: Sequence[VerificationRecord] | None = None,
 ) -> str:
     """Format a runtime result using the required report template.
 
@@ -57,13 +82,14 @@ def format_final_report(
         result: Final result text.
         todos: Current todo status.
         execution_log: Detailed execution records.
-        artifacts: Optional evidence lines.
+        artifacts: Optional artifact records or legacy evidence lines.
+        evidence: Optional evidence records.
+        verification: Optional verification records.
 
     Returns:
         Markdown final report.
     """
     log_by_content = {entry["content"]: entry for entry in execution_log}
-    artifact_lines = [f"- {artifact}" for artifact in artifacts or []] or ["- No artifacts recorded."]
     return "\n".join(
         [
             "## Result",
@@ -76,6 +102,12 @@ def format_final_report(
             *[_plan_status_line(todo, log_by_content) for todo in todos],
             "",
             "## Artifacts And Evidence",
-            *artifact_lines,
+            *_artifact_lines(artifacts),
+            "",
+            "## Evidence",
+            *_evidence_lines(evidence),
+            "",
+            "## Verification",
+            *_verification_lines(verification),
         ]
     )
