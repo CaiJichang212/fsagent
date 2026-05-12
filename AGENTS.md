@@ -15,6 +15,7 @@
 - 后端入口包括：
   - API：`fsagent.api.server:main`
   - 开发启动器：`fsagent.dev:main`
+- 显式模式路由由 `fsagent.slash_router:parse_slash_mode` 处理，只接受带正文的 `/fast ...` 和 `/plan ...`。
 - 前端位于 `frontend/`，使用 Vite、React 和 TypeScript。
 
 ## 目录约定
@@ -24,6 +25,7 @@
 - `fsagent/tests/`：Python 单元测试。
 - `frontend/src/`：前端应用代码。
 - `frontend/tests/`：前端脚本级测试。
+- `docs/`：设计说明、执行计划和测试记录；不要把临时调研内容混入 README。
 - `scripts/start-dev.sh`：一键启动 API 与前端开发服务器。
 - `model_config.json`：模型候选项、thinking 能力和采样参数。
 
@@ -59,6 +61,8 @@ uv run --project harnessagents/fsagent --group test pytest harnessagents/fsagent
 ```bash
 cd frontend
 npm run build
+node --test tests/*.test.mjs
+npm exec -- playwright test --config playwright.controlled-replay.config.mjs
 ```
 
 - 本地开发优先使用根目录脚本：
@@ -77,6 +81,7 @@ npm run build
 - 不要提交真实 `.env`、API Key、令牌或本地私密配置。
 - `.env.example` 只保留示例值。
 - 默认模型配置来自 `.env` 和 `model_config.json`。
+- `mcp.json` 是本地 MCP 配置文件，默认被 `.gitignore` 忽略；不要把包含本地 token、API key 或私人 server 的配置提交到仓库。
 - MCP 配置可能启动本地进程。只有在用户明确要求或确认信任当前项目配置时，才启用项目 stdio MCP server。
 - API 中对应字段为 `trustProjectMcp`。
 
@@ -86,6 +91,8 @@ npm run build
 - 修改 API schema、session 状态或 runtime 输出时，检查 `fsagent/tests/test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py` 等相关测试。
 - 修改开发启动器时，检查 `fsagent/tests/test_dev.py`。
 - 修改模型配置逻辑时，检查 `fsagent/tests/test_model_config.py`。
+- 修改 slash 命令路由时，检查 `fsagent/tests/test_slash_router.py`。
+- 修改前端 review、timeline、markdown 或 controlled replay 行为时，检查 `frontend/tests/` 中对应脚本测试。
 - 如果无法运行完整测试，最终回复中必须说明未运行的命令和原因。
 
 ## 文档维护

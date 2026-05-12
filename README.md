@@ -13,6 +13,7 @@
 - **HTTP API + SSE**：前端可通过普通请求或事件流获取 session、timeline、todo、review、tool call、evidence 和执行日志。
 - **模型配置**：通过 `.env` 和 `model_config.json` 管理模型、thinking 开关和采样参数。
 - **MCP 工具加载**：默认安全关闭；只有显式启用并信任项目 MCP 时才会加载 stdio MCP server。
+- **Slash 模式路由**：`/fast ...` 和 `/plan ...` 可在接入层显式选择运行模式，解析逻辑独立在 `fsagent.slash_router`。
 
 ## 目录结构
 
@@ -20,14 +21,16 @@
 .
 ├── fsagent/
 │   ├── dev.py                 # API + 前端开发启动器：fsagent-dev
+│   ├── slash_router.py        # /fast 和 /plan 显式模式路由
 │   ├── api/                   # FastAPI schema、server、session service
 │   ├── runtime/               # Fast/Plan runtime、planner、executor、MCP、模型配置
 │   └── tests/                 # Python 单元测试
-├── frontend/                  # Vite + React + TypeScript 前端
+├── frontend/                  # Vite + React + TypeScript 前端和脚本级测试
+├── docs/                      # 设计说明、执行计划和测试记录
 ├── scripts/start-dev.sh       # 一键启动后端和前端
 ├── model_config.json          # 前端可选模型和采样配置
 ├── pyproject.toml             # Python 包、脚本和测试依赖配置
-└── mcp.json                   # MCP server 配置示例/项目配置
+└── mcp.json                   # 本地 MCP 配置，默认被 .gitignore 忽略
 ```
 
 ## 环境要求
@@ -85,6 +88,11 @@ FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
 - `AVAILABLE_MODELS_JSON`：模型目录配置，默认读取项目根目录的 `model_config.json`。
 - `FSAGENT_SESSION_STORE_PATH`：可选。设置后 API 使用 JSONL session store 保存 snapshot；未设置时使用内存 store。
 
+日志相关变量：
+
+- `FSAGENT_LOG_LEVEL`：日志级别，未设置时后端默认为 `INFO`；`./scripts/start-dev.sh` 默认设为 `DEBUG`。
+- `FSAGENT_LOG_FILE`：可选 JSONL 日志路径；启动脚本默认写入 `logs/fsagent-api.jsonl`。
+
 ## 运行方式
 
 ### 一键开发启动
@@ -129,6 +137,21 @@ npm run dev
 
 前端 Vite 代理会把 `/api` 转发到 `FSAGENT_API_TARGET`，未设置时默认代理到 `http://127.0.0.1:8000`。
 
+## Slash 模式路由
+
+`fsagent.slash_router.parse_slash_mode` 用于把上层输入显式路由到运行模式：
+
+```text
+/fast 快速检查当前改动
+/plan 为 README 更新制定并执行计划
+```
+
+解析规则：
+
+- 只接受 `/fast ` 或 `/plan ` 前缀，且前缀后必须有正文。
+- 返回 `mode` 和去掉前缀后的 `content`。
+- 不符合格式时抛出 `ValueError("Please start your request with /fast or /plan.")`。
+
 ## API
 
 FastAPI 应用标题为 `fsagent API`。主要接口：
@@ -159,6 +182,8 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
   "toolPolicyProfile": "dev-default"
 }
 ```
+
+`toolPolicyProfile` 可选值为 `dev-default`、`locked-down`、`ci-eval`。省略或传入未知值时，runtime 会回退到 `dev-default`。
 
 Plan 审核请求示例：
 
@@ -226,7 +251,7 @@ API snapshot 包含 `pendingReview`、`reviews`、`toolCalls`、`artifacts`、`e
 
 ## MCP 安全说明
 
-MCP 默认不加载。API 请求中需要设置：
+MCP 默认不加载。`mcp.json` 是本地配置文件，默认被 `.gitignore` 忽略，可能包含本地命令、私有 server 或密钥；不要提交包含真实 token 的 MCP 配置。API 请求中需要设置：
 
 ```json
 {
@@ -235,7 +260,7 @@ MCP 默认不加载。API 请求中需要设置：
 }
 ```
 
-对于 stdio MCP server，还必须显式信任项目配置：
+HTTP、streamable HTTP 和 SSE server 会按配置加载；对于会启动本地进程的 stdio MCP server，还必须显式信任项目配置：
 
 ```json
 {
@@ -287,6 +312,14 @@ cd frontend
 npm run build
 ```
 
+前端脚本级测试：
+
+```bash
+cd frontend
+node --test tests/*.test.mjs
+npm exec -- playwright test --config playwright.controlled-replay.config.mjs
+```
+
 如果当前目录在 monorepo 根目录，可使用：
 
 ```bash
@@ -302,4 +335,6 @@ uv run --project harnessagents/fsagent --group test pytest harnessagents/fsagent
 - API schema、session 状态或 runtime 输出变化时，重点检查 `test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py`。
 - 开发启动器变化时，重点检查 `test_dev.py`。
 - 模型配置逻辑变化时，重点检查 `test_model_config.py`。
+- Slash 模式路由变化时，重点检查 `test_slash_router.py`。
+- 前端 review、timeline、markdown、controlled replay 行为变化时，重点检查 `frontend/tests/` 中对应脚本。
 - 不要提交真实 `.env`、API Key、令牌或本地私密配置。
