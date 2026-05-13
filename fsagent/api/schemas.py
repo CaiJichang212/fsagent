@@ -24,8 +24,8 @@ SessionStatus = Literal[
     "cancelled",
     "failed",
 ]
-TodoStatus = Literal["pending", "in_progress", "completed", "failed"]
-ExecutionStatus = Literal["pending", "in_progress", "completed", "skipped", "failed"]
+TodoStatus = Literal["pending", "in_progress", "completed", "failed", "blocked"]
+ExecutionStatus = Literal["pending", "in_progress", "completed", "skipped", "failed", "blocked"]
 VerificationStatus = Literal["passed", "failed", "skipped", "manual"]
 
 
@@ -54,6 +54,7 @@ class PlanMeta(ApiModel):
     goal: str
     assumptions: list[str] = Field(default_factory=list)
     final_output_format: str | None = None
+    verification: list[str] = Field(default_factory=list)
 
 
 class ExecutionLogEntry(ApiModel):
