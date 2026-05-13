@@ -1,6 +1,6 @@
 from fsagent.api.persistence import InMemorySessionStore, JsonlSessionStore, SessionStoreRecord
 from fsagent.api.schemas import SessionResponse, TimelineEvent, TodoItem
-from fsagent.api.server import _session_store_from_env
+from fsagent.api.server import _checkpointer_from_env, _session_store_from_env
 
 
 def _session(status: str = "awaiting_plan_review") -> SessionResponse:
@@ -85,3 +85,16 @@ def test_session_store_from_env_defaults_to_in_memory_store():
     store = _session_store_from_env({})
 
     assert isinstance(store, InMemorySessionStore)
+
+
+def test_checkpointer_from_env_defaults_to_none():
+    assert _checkpointer_from_env({}) is None
+
+
+def test_checkpointer_from_env_uses_configured_path(tmp_path):
+    path = tmp_path / "checkpoints.sqlite"
+
+    config = _checkpointer_from_env({"FSAGENT_CHECKPOINTER_PATH": str(path)})
+
+    assert config is not None
+    assert config.path == str(path)

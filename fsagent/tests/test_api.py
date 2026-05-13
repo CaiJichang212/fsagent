@@ -20,6 +20,28 @@ class FakeRuntime:
         return self.outputs.pop(0)
 
 
+class GateResumeRuntime:
+    def __init__(
+        self,
+        *,
+        interrupt: dict[str, object],
+        expected_resume: dict[str, object],
+        final_output: dict[str, object] | None = None,
+    ) -> None:
+        self.interrupt = interrupt
+        self.expected_resume = expected_resume
+        self.final_output = final_output or {"status": "completed", "final_response": "resumed"}
+        self.calls: list[tuple[object, object]] = []
+
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        if len(self.calls) == 1:
+            return {"__interrupt__": [SimpleNamespace(value=self.interrupt)]}
+        assert getattr(payload, "resume", None) == self.expected_resume
+        assert config is not None
+        return self.final_output
+
+
 def _run_payload(mode: str = "fast", message: str = "hello") -> dict[str, object]:
     return {
         "mode": mode,
@@ -106,6 +128,41 @@ def test_create_fast_run_returns_completed_session():
     assert runtime.calls[0][0]["mode"] == "fast"
 
 
+def test_create_run_uses_thread_id_as_default_checkpoint_ref():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    store = InMemorySessionStore()
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, session_store=store)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    stored = store.get(body["sessionId"])
+    assert runtime.calls[0][1]["checkpoint_ref"] == body["threadId"]
+    assert stored.checkpoint_ref == body["threadId"]
+
+
+def test_create_run_uses_configured_checkpoint_ref():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    store = InMemorySessionStore()
+    checkpoint_ref = "configured-checkpoints.sqlite"
+    service = FsAgentApiService(
+        runtime_factory=lambda _request: runtime,
+        session_store=store,
+        checkpoint_ref=checkpoint_ref,
+    )
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    stored = store.get(body["sessionId"])
+    assert runtime.calls[0][1]["checkpoint_ref"] == checkpoint_ref
+    assert stored.checkpoint_ref == checkpoint_ref
+
+
 def test_create_run_normalizes_legacy_contract_records_with_stable_ids():
     runtime = FakeRuntime(
         [
@@ -172,6 +229,34 @@ def test_create_run_normalizes_legacy_contract_records_with_stable_ids():
     assert body["timeline"][0]["correlationId"] is None
 
 
+def test_create_run_preserves_blocked_todo_and_execution_status():
+    runtime = FakeRuntime(
+        [
+            {
+                "todos": [{"content": "Wait for credentials", "status": "blocked"}],
+                "execution_log": [
+                    {
+                        "content": "Wait for credentials",
+                        "status": "blocked",
+                        "error": "Missing API key approval",
+                    }
+                ],
+                "final_response": "blocked",
+            }
+        ]
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["todos"][0]["status"] == "blocked"
+    assert body["executionLog"][0]["status"] == "blocked"
+    assert body["executionLog"][0]["error"] == "Missing API key approval"
+
+
 def test_session_response_accepts_verifying_and_needs_revision_statuses():
     base = {
         "sessionId": "session-1",
@@ -218,6 +303,32 @@ def test_create_plan_run_returns_review_session():
     assert body["reviews"] == [body["pendingReview"]]
     assert body["timeline"][-1]["kind"] == "interrupt.plan_review"
     assert body["timeline"][-1]["correlationId"] == body["pendingReview"]["id"]
+
+
+def test_create_plan_review_preserves_plan_meta_verification():
+    command = "uv run --group test pytest fsagent/tests -q"
+    interrupt = SimpleNamespace(
+        value={
+            "kind": "plan_review",
+            "todos": [{"content": "Inspect files", "status": "pending"}],
+            "plan_meta": {
+                "goal": "Connect API",
+                "verification": [command, ""],
+            },
+            "allowed_actions": ["approve", "edit", "retry", "cancel"],
+            "instructions": "Review the plan above.",
+        }
+    )
+    runtime = FakeRuntime([{"__interrupt__": [interrupt]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan", message="connect frontend"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["planMeta"]["verification"] == [command]
+    assert body["pendingReview"]["subject"]["planMeta"]["verification"] == [command]
 
 
 def test_get_run_returns_stored_session():
@@ -364,6 +475,67 @@ def test_generic_plan_review_invalid_action_does_not_mutate_pending_review():
     assert stored["pendingReview"]["status"] == "pending"
     assert stored["reviews"][0]["status"] == "pending"
     assert len(runtime.calls) == 1
+
+
+def test_generic_mcp_review_approve_resumes_with_top_level_action_not_cancel():
+    runtime = GateResumeRuntime(
+        interrupt={
+            "kind": "mcp_review",
+            "risk": "high",
+            "subject": "High risk MCP servers require approval",
+            "proposed_input_summary": "danger-server (stdio, high)",
+            "allowed_actions": ["approve", "deny", "cancel"],
+            "instructions": "Review MCP servers.",
+        },
+        expected_resume={"action": "approve"},
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+    created = client.post("/api/runs", json=_run_payload(mode="fast")).json()
+    review_id = created["pendingReview"]["id"]
+
+    response = client.post(
+        f"/api/runs/{created['sessionId']}/reviews/{review_id}/decision",
+        json={"action": "approve"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["pendingReview"] is None
+    assert body["reviews"][0]["status"] == "approved"
+    assert runtime.calls[1][0].resume == {"action": "approve"}
+
+
+def test_generic_deviation_review_replan_resumes_with_top_level_action():
+    runtime = GateResumeRuntime(
+        interrupt={
+            "kind": "deviation_review",
+            "risk": "medium",
+            "subject": "Executor requested plan deviation",
+            "proposed_input_summary": "Need to reroute execution.",
+            "allowed_actions": ["approve", "replan", "cancel"],
+            "instructions": "Review deviation.",
+        },
+        expected_resume={"action": "replan", "feedback": "Revise the plan."},
+        final_output={"status": "needs_revision", "final_response": "replan requested"},
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+    created = client.post("/api/runs", json=_run_payload(mode="plan")).json()
+    review_id = created["pendingReview"]["id"]
+
+    response = client.post(
+        f"/api/runs/{created['sessionId']}/reviews/{review_id}/decision",
+        json={"action": "replan", "feedback": "Revise the plan."},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "needs_revision"
+    assert body["pendingReview"] is None
+    assert body["reviews"][0]["status"] == "modified"
+    assert runtime.calls[1][0].resume == {"action": "replan", "feedback": "Revise the plan."}
 
 
 def test_tool_interrupt_returns_awaiting_tool_review_not_completed():
@@ -917,6 +1089,62 @@ class AgentToolLifecycleRuntime(FakeRuntime):
         return self.outputs.pop(0)
 
 
+class TodoToolLinkRuntime(FakeRuntime):
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        sink = (config.get("metadata") or {}).get("fsagent_event_sink")
+        if sink is not None:
+            await sink(
+                {
+                    "kind": "planner.completed",
+                    "message": "plan ready",
+                    "todos": [{"id": "todo-001", "content": "Run tests", "status": "pending"}],
+                }
+            )
+            await sink(
+                {
+                    "kind": "agent.tool.completed",
+                    "message": "execute completed",
+                    "tool_name": "execute",
+                    "tool_call_id": "call-execute",
+                    "todo_index": 1,
+                    "todo_content": "Run tests",
+                    "result_size_chars": 12,
+                }
+            )
+            await sink(
+                {
+                    "kind": "todo.completed",
+                    "message": "完成 Run tests",
+                    "todos": [{"id": "todo-001", "content": "Run tests", "status": "completed"}],
+                    "execution_log": [
+                        {
+                            "id": "log-001",
+                            "todo_id": "todo-001",
+                            "content": "Run tests",
+                            "status": "completed",
+                            "result": "ok",
+                        }
+                    ],
+                }
+            )
+        return self.outputs.pop(0)
+
+
+class TodoResolutionRuntime(FakeRuntime):
+    def __init__(self, events: list[dict[str, object]], outputs: list[dict[str, object]]) -> None:
+        super().__init__(outputs)
+        self.events = events
+
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        sink = (config.get("metadata") or {}).get("fsagent_event_sink")
+        if sink is not None:
+            for event in self.events:
+                await sink(event)
+        return self.outputs.pop(0)
+
+
 def test_tool_progress_events_append_tool_calls_instead_of_replacing_history():
     runtime = ToolEventRuntime([{"final_response": "ok"}])
     service = _service(runtime)
@@ -975,6 +1203,123 @@ def test_agent_tool_lifecycle_events_update_existing_tool_call_status():
             "durationMs": 12.5,
         }
     ]
+
+
+def test_tool_lifecycle_event_links_tool_call_to_current_todo_and_log():
+    runtime = TodoToolLinkRuntime([{"final_response": "ok"}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["toolCalls"][0]["todoId"] == "todo-001"
+    assert body["executionLog"][0]["toolCallIds"] == ["call-execute"]
+
+
+def test_tool_lifecycle_event_uses_unique_content_when_index_is_out_of_range():
+    runtime = TodoResolutionRuntime(
+        [
+            {
+                "kind": "planner.completed",
+                "message": "plan ready",
+                "todos": [{"id": "todo-run-tests", "content": "Run tests", "status": "pending"}],
+            },
+            {
+                "kind": "agent.tool.completed",
+                "message": "execute completed",
+                "tool_name": "execute",
+                "tool_call_id": "call-execute",
+                "todo_index": 99,
+                "todo_content": "Run tests",
+            },
+        ],
+        [{"final_response": "ok"}],
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["toolCalls"][0]["todoId"] == "todo-run-tests"
+
+
+def test_duplicate_todo_content_does_not_bind_tool_or_execution_log_by_content():
+    runtime = TodoResolutionRuntime(
+        [
+            {
+                "kind": "planner.completed",
+                "message": "plan ready",
+                "todos": [
+                    {"id": "todo-first", "content": "Run checks", "status": "pending"},
+                    {"id": "todo-second", "content": "Run checks", "status": "pending"},
+                ],
+            },
+            {
+                "kind": "agent.tool.completed",
+                "message": "execute completed",
+                "tool_name": "execute",
+                "tool_call_id": "call-execute",
+                "todo_index": 99,
+                "todo_content": "Run checks",
+            },
+        ],
+        [
+            {
+                "execution_log": [{"id": "log-001", "content": "Run checks", "status": "completed"}],
+                "final_response": "ok",
+            }
+        ],
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["toolCalls"][0]["todoId"] is None
+    assert body["executionLog"][0]["todoId"] not in {"todo-first", "todo-second"}
+    assert body["executionLog"][0]["toolCallIds"] == []
+
+
+def test_execution_log_with_existing_tool_call_ids_is_not_overwritten():
+    runtime = FakeRuntime(
+        [
+            {
+                "todos": [{"id": "todo-001", "content": "Run tests", "status": "completed"}],
+                "tool_calls": [
+                    {
+                        "id": "call-execute",
+                        "todoId": "todo-001",
+                        "name": "execute",
+                        "status": "completed",
+                    }
+                ],
+                "execution_log": [
+                    {
+                        "id": "log-001",
+                        "todo_id": "todo-001",
+                        "content": "Run tests",
+                        "status": "completed",
+                        "toolCallIds": ["call-reviewed"],
+                    }
+                ],
+                "final_response": "ok",
+            }
+        ]
+    )
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["executionLog"][0]["toolCallIds"] == ["call-reviewed"]
 
 
 def test_final_runtime_result_without_execution_log_preserves_streamed_log():

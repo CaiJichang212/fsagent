@@ -1,4 +1,11 @@
-from fsagent.runtime.verifier import verify_execution
+from pathlib import Path
+from subprocess import CompletedProcess
+
+import fsagent.runtime.verifier as verifier_module
+from fsagent.runtime.verification_runner import VerificationCommand
+from fsagent.runtime.verifier import verify_execution, verify_execution_async
+
+PROJECT_ROOT = Path(verifier_module.__file__).resolve().parents[2]
 
 
 def test_verify_execution_records_skipped_reason_when_no_verification_exists():
@@ -63,3 +70,23 @@ def test_verify_execution_passed_record_completes():
     )
 
     assert result.status == "completed"
+
+
+async def test_verify_execution_async_runs_plan_verification_from_project_root():
+    calls: list[VerificationCommand] = []
+
+    async def executor(command: VerificationCommand) -> CompletedProcess[str]:
+        calls.append(command)
+        return CompletedProcess(args=command.command, returncode=0, stdout="passed", stderr="")
+
+    result = await verify_execution_async(
+        todos=[{"id": "todo-001", "content": "Run tests", "status": "completed"}],
+        execution_log=[],
+        plan_meta={"verification": ["uv run --group test pytest fsagent/tests -q"]},
+        executor=executor,
+    )
+
+    assert result.status == "completed"
+    assert calls == [
+        VerificationCommand(command="uv run --group test pytest fsagent/tests -q", cwd=PROJECT_ROOT),
+    ]

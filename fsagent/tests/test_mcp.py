@@ -6,7 +6,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.tools.base import ToolException
 
 from fsagent.runtime import mcp
-from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path
+from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path, summarize_mcp_servers_for_review
 
 
 async def test_load_runtime_mcp_tools_delegates_to_deepagents_cli_loader(monkeypatch, tmp_path):
@@ -251,3 +251,54 @@ def test_resolve_mcp_config_path_captures_relative_path_at_call_time(monkeypatch
 
     monkeypatch.chdir(tmp_path.parent)
     assert path == str(config.resolve())
+
+
+def test_summarize_mcp_servers_for_review_classifies_static_risk(tmp_path):
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "local": {
+                        "command": "python",
+                        "args": ["server.py"],
+                        "description": "Local server.",
+                    },
+                    "docs": {
+                        "url": "https://example.test/mcp",
+                        "description": "Docs server.",
+                    },
+                    "disabled": {
+                        "command": "python",
+                        "args": ["disabled.py"],
+                        "disabled": True,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = summarize_mcp_servers_for_review(str(config), no_mcp=False, trust_project_mcp=True)
+
+    assert result == [
+        {"name": "docs", "transport": "streamable_http", "risk": "medium", "description": "Docs server."},
+        {"name": "local", "transport": "stdio", "risk": "high", "description": "Local server."},
+    ]
+
+
+def test_summarize_mcp_servers_for_review_returns_empty_for_disabled_cases(tmp_path):
+    missing = tmp_path / "missing.json"
+    config = tmp_path / "empty.json"
+    config.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+
+    assert summarize_mcp_servers_for_review(str(config), no_mcp=True, trust_project_mcp=True) == []
+    assert summarize_mcp_servers_for_review(str(missing), no_mcp=False, trust_project_mcp=True) == []
+    assert summarize_mcp_servers_for_review(str(config), no_mcp=False, trust_project_mcp=True) == []
+
+
+def test_summarize_mcp_servers_for_review_returns_empty_for_malformed_config(tmp_path):
+    config = tmp_path / "malformed.json"
+    config.write_text("{not valid json", encoding="utf-8")
+
+    assert summarize_mcp_servers_for_review(str(config), no_mcp=False, trust_project_mcp=True) == []

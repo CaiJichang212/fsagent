@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,46 @@ from pydantic import Field
 
 from fsagent.api._langgraph_compat import Command, InMemorySaver
 from fsagent.runtime.graph import create_runtime
+from fsagent.runtime.mcp import RuntimeMCPResult
+from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
+
+
+def test_build_deviation_review_payload_matches_review_contract():
+    payload = build_deviation_review_payload(
+        subject="Executor requested plan deviation",
+        proposed_input_summary="Need to inspect logs before editing config.",
+    )
+
+    assert payload == {
+        "kind": "deviation_review",
+        "risk": "medium",
+        "subject": "Executor requested plan deviation",
+        "proposed_input_summary": "Need to inspect logs before editing config.",
+        "allowed_actions": ["approve", "replan", "cancel"],
+        "instructions": "Review the requested deviation. Approve to continue, replan to revise the plan, or cancel.",
+    }
+
+
+def test_build_mcp_review_payload_summarizes_servers_for_review():
+    payload = build_mcp_review_payload(
+        servers=[
+            {
+                "name": "local-files",
+                "transport": "stdio",
+                "risk": "high",
+                "description": "Local filesystem MCP.",
+            }
+        ]
+    )
+
+    assert payload == {
+        "kind": "mcp_review",
+        "risk": "high",
+        "subject": "High risk MCP servers require approval",
+        "proposed_input_summary": "local-files (stdio, high) - Local filesystem MCP.",
+        "allowed_actions": ["approve", "deny", "cancel"],
+        "instructions": "Review the MCP servers before enabling them for execution.",
+    }
 
 
 def test_create_runtime_compiles_explicit_mode_graph():
@@ -426,6 +467,284 @@ async def test_plan_planner_does_not_load_mcp_tools_before_review(monkeypatch):
     )
 
     assert "__interrupt__" in result
+
+
+async def test_fast_mode_high_risk_mcp_interrupts_before_runner(tmp_path: Path):
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "local-files": {
+                        "command": "python",
+                        "args": ["server.py"],
+                        "description": "Local filesystem MCP.",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = create_runtime(
+        model=_ToolBindingFakeChatModel(messages=iter([AIMessage(content="done")])),
+        mcp_config_path=str(config_path),
+        trust_project_mcp=True,
+        checkpointer=InMemorySaver(),
+    )
+
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="hello")]},
+        config={"configurable": {"thread_id": "fast-mcp-review-thread"}},
+    )
+
+    assert "__interrupt__" in result
+    interrupt = result["__interrupt__"][0].value
+    assert interrupt["kind"] == "mcp_review"
+    assert interrupt["risk"] == "high"
+    assert "local-files (stdio, high)" in interrupt["proposed_input_summary"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_status", "expected_final_response"),
+    [
+        ("approve", None, "done"),
+        ("deny", "needs_revision", None),
+        ("cancel", "cancelled", None),
+    ],
+)
+async def test_fast_mode_mcp_review_resume_actions_update_state(
+    monkeypatch,
+    tmp_path: Path,
+    action: str,
+    expected_status: str | None,
+    expected_final_response: str | None,
+):
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"local-files": {"command": "python", "args": ["server.py"]}}}),
+        encoding="utf-8",
+    )
+
+    async def fake_load_runtime_mcp_tools(*_args: object, **_kwargs: object) -> RuntimeMCPResult:
+        return RuntimeMCPResult(tools=[])
+
+    monkeypatch.setattr("fsagent.runtime.graph.load_runtime_mcp_tools", fake_load_runtime_mcp_tools)
+    runtime = create_runtime(
+        model=_ToolBindingFakeChatModel(messages=iter([AIMessage(content="done")])),
+        mcp_config_path=str(config_path),
+        trust_project_mcp=True,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": f"fast-mcp-review-{action}-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "fast", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": action}), config=config)
+
+    assert first_result["__interrupt__"][0].value["kind"] == "mcp_review"
+    assert final_result["mcp_review_approved"] is (action == "approve")
+    if expected_status is not None:
+        assert final_result["status"] == expected_status
+    if expected_final_response is not None:
+        assert final_result["final_response"] == expected_final_response
+
+
+async def test_fast_mode_mcp_review_deny_does_not_approve_future_same_thread_invokes(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"local-files": {"command": "python", "args": ["server.py"]}}}),
+        encoding="utf-8",
+    )
+    load_calls = 0
+
+    async def fail_if_mcp_loads_after_denial(*_args: object, **_kwargs: object) -> RuntimeMCPResult:
+        nonlocal load_calls
+        load_calls += 1
+        msg = "Denied MCP review must not load MCP tools on a later same-thread invoke."
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("fsagent.runtime.graph.load_runtime_mcp_tools", fail_if_mcp_loads_after_denial)
+    runtime = create_runtime(
+        model=_ToolBindingFakeChatModel(messages=iter([AIMessage(content="done")])),
+        mcp_config_path=str(config_path),
+        trust_project_mcp=True,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "fast-mcp-review-deny-repeat-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "fast", "messages": [HumanMessage(content="hello")]}, config=config)
+    denied_result = await runtime.ainvoke(Command(resume={"action": "deny"}), config=config)
+    repeat_result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="hello again")]},
+        config=config,
+    )
+
+    assert first_result["__interrupt__"][0].value["kind"] == "mcp_review"
+    assert denied_result["mcp_review_approved"] is False
+    assert repeat_result["__interrupt__"][0].value["kind"] == "mcp_review"
+    assert load_calls == 0
+
+
+async def test_plan_mode_high_risk_mcp_interrupts_after_plan_review(tmp_path: Path):
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "local-files": {
+                        "type": "stdio",
+                        "command": "python",
+                        "args": ["server.py"],
+                        "description": "Local filesystem MCP.",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    runtime = create_runtime(
+        model=model,
+        mcp_config_path=str(config_path),
+        trust_project_mcp=True,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "plan-mcp-review-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    second_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert first_result["__interrupt__"][0].value["kind"] == "plan_review"
+    assert second_result["__interrupt__"][0].value["kind"] == "mcp_review"
+
+
+async def test_plan_mode_deviation_review_triggers_only_from_state(monkeypatch):
+    async def fake_execute_plan(**kwargs: object) -> object:
+        return SimpleNamespace(
+            todos=kwargs["todos"],
+            execution_log=[],
+            evidence=[],
+            final_result="executor requested deviation in natural language",
+        )
+
+    async def fake_verify_execution_async(**_kwargs: object) -> object:
+        return SimpleNamespace(verification=[], status="completed")
+
+    monkeypatch.setattr("fsagent.runtime.graph.create_deep_agent", lambda **_kwargs: object())
+    monkeypatch.setattr("fsagent.runtime.graph.execute_plan", fake_execute_plan)
+    monkeypatch.setattr("fsagent.runtime.graph.verify_execution_async", fake_verify_execution_async)
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "deviation-natural-language-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert first_result["__interrupt__"][0].value["kind"] == "plan_review"
+    assert "__interrupt__" not in final_result
+    assert final_result["status"] == "completed"
+    assert "executor requested deviation in natural language" in final_result["final_response"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    [
+        ("approve", "completed"),
+        ("replan", "needs_revision"),
+        ("cancel", "cancelled"),
+    ],
+)
+async def test_plan_mode_deviation_review_resume_actions_update_state(
+    monkeypatch,
+    action: str,
+    expected_status: str,
+):
+    async def fake_execute_plan(**kwargs: object) -> object:
+        return SimpleNamespace(
+            todos=kwargs["todos"],
+            execution_log=[],
+            evidence=[],
+            final_result="executor done",
+        )
+
+    async def fake_verify_execution_async(**_kwargs: object) -> object:
+        return SimpleNamespace(verification=[], status="completed")
+
+    monkeypatch.setattr("fsagent.runtime.graph.create_deep_agent", lambda **_kwargs: object())
+    monkeypatch.setattr("fsagent.runtime.graph.execute_plan", fake_execute_plan)
+    monkeypatch.setattr("fsagent.runtime.graph.verify_execution_async", fake_verify_execution_async)
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": f"deviation-review-{action}-thread"}}
+
+    first_result = await runtime.ainvoke(
+        {
+            "mode": "plan",
+            "messages": [HumanMessage(content="hello")],
+            "deviation_requested": True,
+            "deviation_reason": "Need to inspect logs before editing config.",
+        },
+        config=config,
+    )
+    second_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": action}), config=config)
+
+    assert first_result["__interrupt__"][0].value["kind"] == "plan_review"
+    assert second_result["__interrupt__"][0].value["kind"] == "deviation_review"
+    assert "Need to inspect logs" in second_result["__interrupt__"][0].value["proposed_input_summary"]
+    assert final_result["status"] == expected_status
+    if action == "approve":
+        assert final_result["deviation_requested"] is False
 
 
 async def test_fast_mode_high_risk_tool_uses_hitl_interrupt():
