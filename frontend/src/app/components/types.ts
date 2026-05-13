@@ -77,6 +77,7 @@ export interface TodoItem {
 export interface PlanMeta {
   goal: string;
   assumptions?: string[];
+  verification?: string[];
   final_output_format?: string;
 }
 
