@@ -9,6 +9,7 @@ from fsagent.runtime.state import ArtifactRecord, EvidenceRecord, ExecutionLogEn
 def _summary_lines(execution_log: Sequence[ExecutionLogEntry]) -> list[str]:
     executed: list[str] = []
     skipped: list[str] = []
+    blocked: list[str] = []
     failed: list[str] = []
     for entry in execution_log:
         result = entry.get("result")
@@ -17,7 +18,10 @@ def _summary_lines(execution_log: Sequence[ExecutionLogEntry]) -> list[str]:
         elif entry["status"] == "skipped":
             detail = result or "Already completed."
             skipped.append(f"- {entry['content']} - {detail}")
-        elif entry["status"] in {"failed", "blocked"}:
+        elif entry["status"] == "blocked":
+            detail = entry.get("error") or result or entry["status"]
+            blocked.append(f"- {entry['content']} - {detail}")
+        elif entry["status"] == "failed":
             detail = entry.get("error") or result or entry["status"]
             failed.append(f"- {entry['content']} - {detail}")
 
@@ -25,6 +29,8 @@ def _summary_lines(execution_log: Sequence[ExecutionLogEntry]) -> list[str]:
     lines.extend(executed or ["- No executed items recorded."])
     if skipped:
         lines.extend(["", "### Skipped / Already Completed", *skipped])
+    if blocked:
+        lines.extend(["", "### Blocked", *blocked])
     if failed:
         lines.extend(["", "### Failed", *failed])
     return lines
@@ -33,9 +39,12 @@ def _summary_lines(execution_log: Sequence[ExecutionLogEntry]) -> list[str]:
 def _plan_status_line(todo: Mapping[str, Any], log_by_content: Mapping[str, ExecutionLogEntry]) -> str:
     content = str(todo["content"])
     entry = log_by_content.get(content)
-    if entry is not None and entry["status"] in {"failed", "blocked"}:
+    if entry is not None and entry["status"] == "blocked":
         detail = entry.get("error") or entry.get("result") or entry["status"]
-        return f"- [!] {content} - {detail}"
+        return f"- [!] Blocked: {content} - {detail}"
+    if entry is not None and entry["status"] == "failed":
+        detail = entry.get("error") or entry.get("result") or entry["status"]
+        return f"- [!] Failed: {content} - {detail}"
     if entry is not None and entry["status"] == "skipped":
         detail = entry.get("result") or "Already completed."
         return f"- [-] Skipped / already completed: {content} - {detail}"
