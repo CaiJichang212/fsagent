@@ -7,7 +7,7 @@
 - **Fast 模式**：直接调用 Deep Agents 风格 agent，适合一次性快速任务。
 - **Plan 模式**：先生成 todo 计划，等待用户审核后再逐项执行，并输出执行摘要。
 - **通用审核模型**：计划审核兼容旧 `/review` 端点；工具、偏离计划和 MCP 审核共用 `pendingReview` / `reviews` contract。
-- **Session Store**：默认使用内存 store，提供 JSONL store 作为本地恢复适配；服务重启后可查询 snapshot，恢复执行仍需要可用 runtime checkpoint。
+- **Session Store**：默认使用内存 store，提供 JSONL store 作为本地 snapshot 恢复适配；服务重启后可查询 API snapshot，但跨进程 runtime resume 尚未实现。`FSAGENT_CHECKPOINTER_PATH` 目前只读取并记录 checkpoint reference，真实 SQLite/Postgres saver 仍 planned。
 - **工具策略**：内置 `dev-default`、`locked-down`、`ci-eval` profile，高风险工具进入审核，未知工具默认拒绝。
 - **验证与证据报告**：Todo、执行日志、证据、产物、工具调用和 verification 都有稳定 ID，最终报告包含验证结果或跳过原因。
 - **HTTP API + SSE**：前端可通过普通请求或事件流获取 session、timeline、todo、review、tool call、evidence 和执行日志。
@@ -78,6 +78,7 @@ BASE_URL=https://api-inference.modelscope.cn/v1
 API_KEY=xxx
 AVAILABLE_MODELS_JSON=model_config.json
 FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
+FSAGENT_CHECKPOINTER_PATH=logs/fsagent-checkpoints.sqlite
 ```
 
 说明：
@@ -87,6 +88,7 @@ FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
 - `API_KEY`：模型服务密钥；不要提交真实值。
 - `AVAILABLE_MODELS_JSON`：模型目录配置，默认读取项目根目录的 `model_config.json`。
 - `FSAGENT_SESSION_STORE_PATH`：可选。设置后 API 使用 JSONL session store 保存 snapshot；未设置时使用内存 store。
+- `FSAGENT_CHECKPOINTER_PATH`：可选。当前仅作为 checkpoint reference 配置被读取和记录，不会启用完整 LangGraph 持久化恢复。
 
 日志相关变量：
 
@@ -179,11 +181,13 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
   "mcpEnabled": false,
   "trustProjectMcp": false,
   "mcpConfigPath": "mcp.json",
+  "profile": "dev-default",
+  "permissionProfile": "workspace-edit",
   "toolPolicyProfile": "dev-default"
 }
 ```
 
-`toolPolicyProfile` 可选值为 `dev-default`、`locked-down`、`ci-eval`。省略或传入未知值时，runtime 会回退到 `dev-default`。
+`toolPolicyProfile` 可选值为 `dev-default`、`locked-down`、`ci-eval`。省略时使用 runtime 解析出的默认值；传入未知 profile 会被拒绝，不再回退到 `dev-default`。
 
 Plan 审核请求示例：
 
@@ -230,9 +234,23 @@ Plan 模式的最终报告包含：
 
 `completed` 只应在 verification 通过，或记录了明确的 skipped/manual verification reason 后出现。verification 失败时 session 可进入 `needs_revision`。
 
+### Runtime Profiles
+
+`toolPolicyProfile`, `permissionProfile`, and `profile` are resolved by the fsagent runtime before creating the Fast/Plan graph. Unknown profile names are rejected. `workspace-readonly` denies filesystem writes through Deep Agents filesystem permissions and selects the locked-down tool policy.
+
+### Verification
+
+Plan mode records verification for every completed run. When a plan supplies allowlisted verification commands, fsagent can execute them and store summarized `VerificationRecord` entries. Non-allowlisted commands are skipped with an explicit reason.
+
+### Persistence
+
+The JSONL session store is a local snapshot store. It preserves API snapshots across process restart, but runtime resume still requires a live LangGraph checkpoint unless a persistent checkpointer is configured.
+
+Current implementation note: `FSAGENT_CHECKPOINTER_PATH` only records a checkpoint reference; it does not yet instantiate a persistent LangGraph saver, so cross-process runtime resume remains partial/planned.
+
 ## Session 与持久化
 
-API snapshot 包含 `pendingReview`、`reviews`、`toolCalls`、`artifacts`、`evidence` 和 `verification`。未设置 `FSAGENT_SESSION_STORE_PATH` 时，`InMemorySessionStore` 保持默认行为；设置该路径后，API 使用 `JsonlSessionStore` 本地保存和重载 session snapshot。注意：JSONL store 只保存 API snapshot 和 resume metadata，不保存 LangGraph runtime/checkpoint 本体；如果服务重启后缺少 runtime checkpoint，`GET /api/runs/{sessionId}` 仍可返回 snapshot，但 review/resume 会返回 `409 Runtime checkpoint missing for session.`。
+API snapshot 包含 `pendingReview`、`reviews`、`toolCalls`、`artifacts`、`evidence` 和 `verification`。未设置 `FSAGENT_SESSION_STORE_PATH` 时，`InMemorySessionStore` 保持默认行为；设置该路径后，API 使用 `JsonlSessionStore` 本地保存和重载 session snapshot。注意：JSONL store 只保存 API snapshot 和 resume metadata，不保存 LangGraph runtime/checkpoint 本体；`FSAGENT_CHECKPOINTER_PATH` 目前也只是配置和引用记录，不会启用完整持久化恢复。如果服务重启后缺少 runtime checkpoint，`GET /api/runs/{sessionId}` 仍可返回 snapshot，但 review/resume 会返回 `409 Runtime checkpoint missing for session.`。
 
 ## 默认工具策略
 
