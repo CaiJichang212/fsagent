@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+from fsagent.runtime.verification_runner import VerificationExecutor, run_verification_commands
 
-    from fsagent.runtime.state import ExecutionLogEntry, TodoItem, VerificationRecord
+if TYPE_CHECKING:
+    from fsagent.runtime.state import ExecutionLogEntry, PlanMeta, TodoItem, VerificationRecord
 
 VerificationCompletionStatus = Literal["completed", "needs_revision"]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +32,33 @@ def verify_execution(
 ) -> VerificationResult:
     """Normalize verification records and determine completion status."""
     records = _verification_records(verification)
+    return _verification_result(todos=todos, execution_log=execution_log, records=records)
+
+
+async def verify_execution_async(
+    *,
+    todos: Sequence[TodoItem],
+    execution_log: Sequence[ExecutionLogEntry],
+    plan_meta: PlanMeta | Mapping[str, object] | None = None,
+    verification: Sequence[Mapping[str, object]] | None = None,
+    cwd: str | Path | None = None,
+    executor: VerificationExecutor | None = None,
+) -> VerificationResult:
+    """Normalize or run verification records and determine completion status."""
+    records = _verification_records(verification)
+    if not records:
+        commands = _verification_commands_from_plan_meta(plan_meta)
+        if commands:
+            records = await run_verification_commands(commands, cwd=cwd or _PROJECT_ROOT, executor=executor)
+    return _verification_result(todos=todos, execution_log=execution_log, records=records)
+
+
+def _verification_result(
+    *,
+    todos: Sequence[TodoItem],
+    execution_log: Sequence[ExecutionLogEntry],
+    records: list[VerificationRecord],
+) -> VerificationResult:
     if not records:
         records = [
             {
@@ -50,6 +80,15 @@ def verify_execution(
         else "completed"
     )
     return VerificationResult(status=status, verification=records)
+
+
+def _verification_commands_from_plan_meta(plan_meta: PlanMeta | Mapping[str, object] | None) -> list[str]:
+    if not isinstance(plan_meta, Mapping):
+        return []
+    verification = plan_meta.get("verification")
+    if not isinstance(verification, list):
+        return []
+    return [str(item).strip() for item in verification if str(item).strip()]
 
 
 def _has_execution_failure(
