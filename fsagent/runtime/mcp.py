@@ -72,6 +72,46 @@ def describe_mcp_config_for_planner(
     return "\n".join(lines)
 
 
+def summarize_mcp_servers_for_review(
+    config_path: str | None,
+    *,
+    no_mcp: bool,
+    trust_project_mcp: bool | None,
+) -> list[dict[str, str]]:
+    """Return static MCP server review metadata without starting MCP clients."""
+    if no_mcp or config_path is None:
+        return []
+
+    resolved_config_path = resolve_mcp_config_path(config_path)
+    if resolved_config_path is None:
+        return []
+    path = Path(resolved_config_path)
+    if not path.exists():
+        return []
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        normalized = _normalize_explicit_mcp_config(raw, trust_project_mcp=trust_project_mcp)
+    except Exception:  # noqa: BLE001  # review gates must fail closed instead of crashing on malformed config
+        return []
+    summaries: list[dict[str, str]] = []
+    for name in sorted(normalized["mcpServers"]):
+        server = normalized["mcpServers"][name]
+        transport = str(_infer_transport(server) or "unknown")
+        if transport == "streamable-http":
+            transport = "streamable_http"
+        summary = {
+            "name": name,
+            "transport": transport,
+            "risk": "high" if transport == "stdio" else "medium",
+        }
+        description = _string_value(server.get("description"))
+        if description is not None:
+            summary["description"] = description
+        summaries.append(summary)
+    return summaries
+
+
 async def load_runtime_mcp_tools(
     config_path: str | None,
     *,
