@@ -21,6 +21,8 @@ class ExecutionResult:
     execution_log: list[ExecutionLogEntry]
     evidence: list[EvidenceRecord]
     final_result: str
+    deviation_requested: bool = False
+    deviation_reason: str | None = None
 
 
 async def execute_plan(
@@ -47,6 +49,8 @@ async def execute_plan(
     execution_log: list[ExecutionLogEntry] = []
     evidence: list[EvidenceRecord] = []
     results: list[str] = []
+    deviation_requested = False
+    deviation_reason: str | None = None
 
     for index, todo in enumerate(updated):
         if todo["status"] == "completed":
@@ -119,6 +123,12 @@ async def execute_plan(
             )
             continue
 
+        if result.get("deviation_requested") is True:
+            deviation_requested = True
+            reason = str(result.get("deviation_reason") or "")
+            if reason and deviation_reason is None:
+                deviation_reason = reason
+
         item_result = _extract_result_text(result)
         evidence_id = f"evidence-{len(evidence) + 1:03d}"
         evidence.append(
@@ -162,7 +172,14 @@ async def execute_plan(
         )
 
     final_result = "\n".join(result for result in results if result) or "Plan execution completed."
-    return ExecutionResult(todos=updated, execution_log=execution_log, evidence=evidence, final_result=final_result)
+    return ExecutionResult(
+        todos=updated,
+        execution_log=execution_log,
+        evidence=evidence,
+        final_result=final_result,
+        deviation_requested=deviation_requested,
+        deviation_reason=deviation_reason,
+    )
 
 
 def _normalize_todo(todo: TodoItem, index: int) -> TodoItem:
