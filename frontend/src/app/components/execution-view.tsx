@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Loader2, X, CircleDashed, SkipForward } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Loader2, X, CircleDashed, SkipForward } from "lucide-react";
 import { Progress } from "./ui/progress";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -21,8 +21,9 @@ export function ExecutionView({ todos, log }: Props) {
   const completed = log.filter((e) => e.status === "completed").length;
   const skippedCount = log.filter((e) => e.status === "skipped").length;
   const failed = log.filter((e) => e.status === "failed").length;
+  const blocked = log.filter((e) => e.status === "blocked").length;
   const inProgress = log.find((e) => e.status === "in_progress");
-  const pct = total === 0 ? 0 : Math.round(((completed + skippedCount + failed) / total) * 100);
+  const pct = total === 0 ? 0 : Math.round(((completed + skippedCount + failed + blocked) / total) * 100);
 
   return (
     <Collapsible defaultOpen>
@@ -50,6 +51,7 @@ export function ExecutionView({ todos, log }: Props) {
             <span className="text-emerald-500">已完成 {completed}</span>
             {skippedCount > 0 && <span className="text-muted-foreground">跳过 {skippedCount}</span>}
             {failed > 0 && <span className="text-destructive">失败 {failed}</span>}
+            {blocked > 0 && <span className="text-amber-600">受阻 {blocked}</span>}
             {inProgress && (
               <span className="flex items-center gap-1 text-primary">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -76,6 +78,8 @@ export function ExecutionView({ todos, log }: Props) {
                       <Loader2 className="w-4 h-4 text-primary animate-spin" />
                     ) : status === "failed" ? (
                       <X className="w-4 h-4 text-destructive" />
+                    ) : status === "blocked" ? (
+                      <AlertTriangle className="w-4 h-4 text-amber-600" />
                     ) : (
                       <CircleDashed className="w-4 h-4 text-muted-foreground" />
                     )}
@@ -83,12 +87,23 @@ export function ExecutionView({ todos, log }: Props) {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-muted-foreground w-5">{i + 1}.</span>
-                      <span className={cn("text-sm", status === "failed" && "text-destructive")}>
+                      <span
+                        className={cn(
+                          "text-sm",
+                          status === "failed" && "text-destructive",
+                          status === "blocked" && "text-amber-700",
+                        )}
+                      >
                         {t.content}
                       </span>
                       {skipped && (
                         <Badge variant="secondary" className="text-xs">
                           已完成，跳过执行
+                        </Badge>
+                      )}
+                      {status === "blocked" && (
+                        <Badge variant="secondary" className="text-xs text-amber-700">
+                          受阻
                         </Badge>
                       )}
                     </div>

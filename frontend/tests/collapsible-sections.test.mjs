@@ -7,6 +7,7 @@ import { dirname, resolve } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const planReviewSource = readFileSync(resolve(__dirname, "../src/app/components/plan-review-panel.tsx"), "utf8");
 const executionViewSource = readFileSync(resolve(__dirname, "../src/app/components/execution-view.tsx"), "utf8");
+const typesSource = readFileSync(resolve(__dirname, "../src/app/components/types.ts"), "utf8");
 
 test("plan review todos are rendered in a collapsible section", () => {
   assert.match(planReviewSource, /ChevronDown/);
@@ -28,4 +29,13 @@ test("execution progress details are rendered in a collapsible section", () => {
     executionViewSource,
     /<CollapsibleContent>\s*<ul className="divide-y divide-border">/s,
   );
+});
+
+test("blocked todo and execution statuses are handled explicitly", () => {
+  assert.match(typesSource, /export type TodoStatus = .*"blocked"/s);
+  assert.match(typesSource, /export type ExecutionStatus = TodoStatus \| "skipped"/);
+  assert.match(executionViewSource, /const blocked = log\.filter\(\(e\) => e\.status === "blocked"\)\.length/);
+  assert.match(executionViewSource, /受阻 \{blocked\}/);
+  assert.match(executionViewSource, /status === "blocked"/);
+  assert.match(executionViewSource, /text-amber-600/);
 });
