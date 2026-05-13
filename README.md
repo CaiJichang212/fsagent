@@ -182,6 +182,7 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
   "trustProjectMcp": false,
   "mcpConfigPath": "mcp.json",
   "profile": "dev-default",
+  "backendProfile": "ephemeral",
   "permissionProfile": "workspace-edit",
   "toolPolicyProfile": "dev-default"
 }
@@ -200,7 +201,7 @@ Plan 审核请求示例：
 可选 `action`：
 
 - `approve`：批准计划并开始执行。
-- `edit`：提交修改后的 `todos` 和可选 `planMeta`。
+- `edit`：提交修改后的 `todos` 和可选 `planMeta`。编辑时会保留原始计划中的 `verification` 建议字段。
 - `retry`：带 `feedback` 重新生成计划。
 - `cancel`：取消 session，可带 `reason`。
 
@@ -214,6 +215,13 @@ Plan 审核请求示例：
 ```
 
 Plan review 支持 `approve`、`edit`、`retry`、`cancel`；tool review 支持 `approve`、`modify`、`deny`、`cancel`；deviation review 支持 `approve`、`replan`、`cancel`；MCP review 支持 `approve`、`deny`、`cancel`。旧 `/review` 端点仍作为 plan-review shorthand 保留。
+
+## Review 行为说明
+
+- **Plan review edit**：编辑时会保留原始计划中的 `verification` 建议字段。
+- **Deviation review**：由 executor 显式请求触发，当执行过程中需要偏离已批准的计划时发起。
+- **MCP / Deviation review subject**：保留结构化字段，deviation review 的 subject 包含 `source`、`summary`、`reason`；MCP review 的 subject 包含 `servers` 列表。
+- **Parsed-only backend profiles**：`sandbox-exec` 和 `store-backed` 会发出 `runtime.profile_warning` timeline event。
 
 ## Runtime 工作流
 
@@ -236,17 +244,19 @@ Plan 模式的最终报告包含：
 
 ### Runtime Profiles
 
-`toolPolicyProfile`, `permissionProfile`, and `profile` are resolved by the fsagent runtime before creating the Fast/Plan graph. Unknown profile names are rejected. `workspace-readonly` denies filesystem writes through Deep Agents filesystem permissions and selects the locked-down tool policy.
+`profile`、`backendProfile`、`permissionProfile` 和 `toolPolicyProfile` 由 fsagent runtime 在创建 Fast/Plan 图之前解析。未知的 profile 名称会被拒绝。`workspace-readonly` 通过 Deep Agents 文件系统权限拒绝文件写入，并选择 locked-down 工具策略。
+
+`backendProfile` 接受 `ephemeral`、`workspace-readonly`、`workspace-edit`、`sandbox-exec` 和 `store-backed`。`sandbox-exec` 和 `store-backed` 目前仅为解析状态：API 接受它们以保持向前兼容，但尚未由生产运行时完全支持。请求这些 profile 的会话会发出明确的 `runtime.profile_warning` timeline 事件，而不是静默接受仅解析的选择。
 
 ### Verification
 
-Plan mode records verification for every completed run. When a plan supplies allowlisted verification commands, fsagent can execute them and store summarized `VerificationRecord` entries. Non-allowlisted commands are skipped with an explicit reason.
+Plan 模式为每次完成的运行记录验证。当计划提供白名单内的验证命令时，fsagent 可以执行它们并存储摘要的 `VerificationRecord` 条目。非白名单命令会被跳过并给出明确原因。
 
 ### Persistence
 
-The JSONL session store is a local snapshot store. It preserves API snapshots across process restart, but runtime resume still requires a live LangGraph checkpoint unless a persistent checkpointer is configured.
+JSONL session store 是本地快照存储。它在进程重启间保留 API 快照，但运行时恢复仍需要活跃的 LangGraph checkpoint，除非配置了持久化 checkpointer。
 
-Current implementation note: `FSAGENT_CHECKPOINTER_PATH` only records a checkpoint reference; it does not yet instantiate a persistent LangGraph saver, so cross-process runtime resume remains partial/planned.
+当前实现说明：`FSAGENT_CHECKPOINTER_PATH` 只记录 checkpoint 引用；它尚未实例化持久化 LangGraph saver，因此跨进程运行时恢复仍然是部分/计划中的。
 
 ## Session 与持久化
 
