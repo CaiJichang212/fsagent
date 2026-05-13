@@ -71,6 +71,7 @@ export function PlanReviewPanel({
     setDraftMeta({
       goal: planMeta.goal,
       assumptions: [...(planMeta.assumptions ?? [])],
+      verification: [...(planMeta.verification ?? [])],
       final_output_format: planMeta.final_output_format,
     });
     setEditing(true);
@@ -110,6 +111,7 @@ export function PlanReviewPanel({
       {
         goal: draftMeta.goal.trim(),
         assumptions: (draftMeta.assumptions ?? []).map((a) => a.trim()).filter(Boolean),
+        verification: (draftMeta.verification ?? []).map((item) => item.trim()).filter(Boolean),
         final_output_format: draftMeta.final_output_format?.trim() || "markdown",
       },
     );
