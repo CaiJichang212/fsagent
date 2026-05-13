@@ -8,6 +8,7 @@ from fsagent.api.persistence import InMemorySessionStore
 from fsagent.api.schemas import RunRequest, SessionResponse
 from fsagent.api.server import create_app
 from fsagent.api.service import FsAgentApiService
+from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
 
 
 class FakeRuntime:
@@ -126,6 +127,21 @@ def test_create_fast_run_returns_completed_session():
     assert body["finalResponse"] == "fast result"
     assert body["timeline"][-1]["kind"] == "run.completed"
     assert runtime.calls[0][0]["mode"] == "fast"
+
+
+def test_create_run_surfaces_parsed_only_backend_profile_warning():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+    payload = {**_run_payload(), "backendProfile": "sandbox-exec"}
+
+    response = client.post("/api/runs", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert any(
+        event["kind"] == "runtime.profile_warning" and "sandbox-exec" in event["message"] for event in body["timeline"]
+    )
 
 
 def test_create_run_uses_thread_id_as_default_checkpoint_ref():
@@ -479,20 +495,25 @@ def test_generic_plan_review_invalid_action_does_not_mutate_pending_review():
 
 def test_generic_mcp_review_approve_resumes_with_top_level_action_not_cancel():
     runtime = GateResumeRuntime(
-        interrupt={
-            "kind": "mcp_review",
-            "risk": "high",
-            "subject": "High risk MCP servers require approval",
-            "proposed_input_summary": "danger-server (stdio, high)",
-            "allowed_actions": ["approve", "deny", "cancel"],
-            "instructions": "Review MCP servers.",
-        },
+        interrupt=build_mcp_review_payload(
+            servers=[
+                {
+                    "name": "danger-server",
+                    "transport": "stdio",
+                    "risk": "high",
+                    "description": "Local execution MCP.",
+                }
+            ]
+        ),
         expected_resume={"action": "approve"},
     )
     service = _service(runtime)
     client = TestClient(create_app(service))
     created = client.post("/api/runs", json=_run_payload(mode="fast")).json()
     review_id = created["pendingReview"]["id"]
+
+    assert created["pendingReview"]["subject"]["servers"][0]["name"] == "danger-server"
+    assert created["pendingReview"]["subject"]["servers"][0]["risk"] == "high"
 
     response = client.post(
         f"/api/runs/{created['sessionId']}/reviews/{review_id}/decision",
@@ -509,14 +530,10 @@ def test_generic_mcp_review_approve_resumes_with_top_level_action_not_cancel():
 
 def test_generic_deviation_review_replan_resumes_with_top_level_action():
     runtime = GateResumeRuntime(
-        interrupt={
-            "kind": "deviation_review",
-            "risk": "medium",
-            "subject": "Executor requested plan deviation",
-            "proposed_input_summary": "Need to reroute execution.",
-            "allowed_actions": ["approve", "replan", "cancel"],
-            "instructions": "Review deviation.",
-        },
+        interrupt=build_deviation_review_payload(
+            subject="Executor requested plan deviation",
+            proposed_input_summary="Need to reroute execution.",
+        ),
         expected_resume={"action": "replan", "feedback": "Revise the plan."},
         final_output={"status": "needs_revision", "final_response": "replan requested"},
     )
@@ -524,6 +541,12 @@ def test_generic_deviation_review_replan_resumes_with_top_level_action():
     client = TestClient(create_app(service))
     created = client.post("/api/runs", json=_run_payload(mode="plan")).json()
     review_id = created["pendingReview"]["id"]
+
+    assert created["pendingReview"]["subject"] == {
+        "source": "executor",
+        "summary": "Executor requested plan deviation",
+        "reason": "Need to reroute execution.",
+    }
 
     response = client.post(
         f"/api/runs/{created['sessionId']}/reviews/{review_id}/decision",
@@ -536,6 +559,57 @@ def test_generic_deviation_review_replan_resumes_with_top_level_action():
     assert body["pendingReview"] is None
     assert body["reviews"][0]["status"] == "modified"
     assert runtime.calls[1][0].resume == {"action": "replan", "feedback": "Revise the plan."}
+
+
+def test_mcp_review_with_action_requests_preserves_mapping_subject():
+    interrupt = build_mcp_review_payload(
+        servers=[
+            {
+                "name": "danger-server",
+                "transport": "stdio",
+                "risk": "high",
+                "description": "Local execution MCP.",
+            }
+        ]
+    )
+    interrupt["action_requests"] = [
+        {"name": "execute", "args": {"command": "python server.py"}, "description": "Review execute"}
+    ]
+    interrupt["review_configs"] = [{"action_name": "execute", "allowed_decisions": ["approve", "reject"]}]
+    runtime = FakeRuntime([{"__interrupt__": [SimpleNamespace(value=interrupt)]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="fast"))
+
+    assert response.status_code == 200
+    review = response.json()["pendingReview"]
+    assert review["kind"] == "mcp_review"
+    assert review["subject"]["servers"][0]["name"] == "danger-server"
+    assert "actionRequests" not in review["subject"]
+
+
+def test_deviation_review_with_action_requests_preserves_mapping_subject():
+    interrupt = build_deviation_review_payload(
+        subject="Executor requested plan deviation",
+        proposed_input_summary="Need to reroute execution.",
+    )
+    interrupt["action_requests"] = [
+        {"name": "execute", "args": {"command": "uv run pytest"}, "description": "Review execute"}
+    ]
+    interrupt["review_configs"] = [{"action_name": "execute", "allowed_decisions": ["approve", "reject"]}]
+    runtime = FakeRuntime([{"__interrupt__": [SimpleNamespace(value=interrupt)]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    review = response.json()["pendingReview"]
+    assert review["kind"] == "deviation_review"
+    assert review["subject"]["reason"] == "Need to reroute execution."
+    assert review["subject"]["summary"] == "Executor requested plan deviation"
+    assert "actionRequests" not in review["subject"]
 
 
 def test_tool_interrupt_returns_awaiting_tool_review_not_completed():
@@ -594,6 +668,37 @@ def test_langchain_hitl_tool_interrupt_payload_becomes_review_record():
     assert review["subject"]["actionRequests"][0]["name"] == "execute"
     assert review["subject"]["actionRequests"][0]["args"]["command"] == "uv run pytest fsagent/tests -q"
     assert "execute" in review["proposedInputSummary"]
+
+
+def test_tool_interrupt_with_subject_preserves_hitl_action_requests():
+    interrupt = SimpleNamespace(
+        value={
+            "kind": "tool_review",
+            "subject": {"toolCallId": "legacy-tool-001", "name": "legacy_execute"},
+            "action_requests": [
+                {
+                    "name": "execute",
+                    "args": {"command": "uv run pytest fsagent/tests -q"},
+                    "description": "Tool execution requires approval\n\nTool: execute",
+                }
+            ],
+            "review_configs": [{"action_name": "execute", "allowed_decisions": ["approve", "edit", "reject"]}],
+        }
+    )
+    runtime = FakeRuntime([{"__interrupt__": [interrupt]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    review = response.json()["pendingReview"]
+    assert review["subject"]["actionRequests"][0]["name"] == "execute"
+    assert review["subject"]["actionRequests"][0]["args"]["command"] == "uv run pytest fsagent/tests -q"
+    assert review["subject"]["reviewConfigs"] == [
+        {"actionName": "execute", "allowedDecisions": ["approve", "edit", "reject"]}
+    ]
+    assert "toolCallId" not in review["subject"]
 
 
 def test_generic_tool_review_approve_resumes_all_langchain_hitl_actions():

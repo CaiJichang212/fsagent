@@ -143,3 +143,93 @@ async def test_execute_plan_links_todo_execution_log_and_evidence_ids():
             "created_at": None,
         }
     ]
+
+
+class DeviationAgent(RecordingAgent):
+    async def ainvoke(self, state, config=None):
+        self.messages.append(state["messages"][-1].content)
+        self.states.append(state)
+        self.configs.append(config)
+        return {
+            "final_response": "need review",
+            "deviation_requested": True,
+            "deviation_reason": "Need to inspect logs before editing config.",
+        }
+
+
+async def test_execute_plan_preserves_explicit_deviation_marker():
+    agent = DeviationAgent()
+
+    result = await execute_plan(
+        agent=agent,
+        todos=[{"content": "更新配置", "status": "pending"}],
+    )
+
+    assert result.final_result == "need review"
+    assert result.deviation_requested is True
+    assert result.deviation_reason == "Need to inspect logs before editing config."
+
+
+class NonBooleanDeviationAgent(RecordingAgent):
+    def __init__(self, marker: object) -> None:
+        super().__init__()
+        self.marker = marker
+
+    async def ainvoke(self, state, config=None):
+        self.messages.append(state["messages"][-1].content)
+        self.states.append(state)
+        self.configs.append(config)
+        return {
+            "final_response": "truthy marker",
+            "deviation_requested": self.marker,
+            "deviation_reason": "Truthy non-boolean marker must be ignored.",
+        }
+
+
+async def test_execute_plan_ignores_truthy_non_boolean_deviation_markers():
+    for marker in (1, "true", "false"):
+        result = await execute_plan(
+            agent=NonBooleanDeviationAgent(marker),
+            todos=[{"content": "检查 marker", "status": "pending"}],
+        )
+
+        assert result.deviation_requested is False
+        assert result.deviation_reason is None
+
+
+class MultipleDeviationAgent(RecordingAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results = iter(
+            [
+                {
+                    "final_response": "first",
+                    "deviation_requested": True,
+                    "deviation_reason": "First reason.",
+                },
+                {
+                    "final_response": "second",
+                    "deviation_requested": True,
+                    "deviation_reason": "Second reason.",
+                },
+            ]
+        )
+
+    async def ainvoke(self, state, config=None):
+        self.messages.append(state["messages"][-1].content)
+        self.states.append(state)
+        self.configs.append(config)
+        return next(self.results)
+
+
+async def test_execute_plan_preserves_first_non_empty_deviation_reason():
+    result = await execute_plan(
+        agent=MultipleDeviationAgent(),
+        todos=[
+            {"content": "第一项", "status": "pending"},
+            {"content": "第二项", "status": "pending"},
+        ],
+    )
+
+    assert result.deviation_requested is True
+    assert result.deviation_reason == "First reason."

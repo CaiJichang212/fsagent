@@ -9,14 +9,14 @@ from deepagents.backends.protocol import BackendProtocol, FileDownloadResponse, 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool, tool
 from pydantic import Field
 
 from fsagent.api._langgraph_compat import Command, InMemorySaver
-from fsagent.runtime.graph import create_runtime
+from fsagent.runtime.graph import _planner_repo_rules, create_runtime
 from fsagent.runtime.mcp import RuntimeMCPResult
 from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
 
@@ -30,7 +30,11 @@ def test_build_deviation_review_payload_matches_review_contract():
     assert payload == {
         "kind": "deviation_review",
         "risk": "medium",
-        "subject": "Executor requested plan deviation",
+        "subject": {
+            "source": "executor",
+            "summary": "Executor requested plan deviation",
+            "reason": "Need to inspect logs before editing config.",
+        },
         "proposed_input_summary": "Need to inspect logs before editing config.",
         "allowed_actions": ["approve", "replan", "cancel"],
         "instructions": "Review the requested deviation. Approve to continue, replan to revise the plan, or cancel.",
@@ -52,7 +56,16 @@ def test_build_mcp_review_payload_summarizes_servers_for_review():
     assert payload == {
         "kind": "mcp_review",
         "risk": "high",
-        "subject": "High risk MCP servers require approval",
+        "subject": {
+            "servers": [
+                {
+                    "name": "local-files",
+                    "transport": "stdio",
+                    "risk": "high",
+                    "description": "Local filesystem MCP.",
+                }
+            ],
+        },
         "proposed_input_summary": "local-files (stdio, high) - Local filesystem MCP.",
         "allowed_actions": ["approve", "deny", "cancel"],
         "instructions": "Review the MCP servers before enabling them for execution.",
@@ -643,6 +656,8 @@ async def test_plan_mode_deviation_review_triggers_only_from_state(monkeypatch):
             execution_log=[],
             evidence=[],
             final_result="executor requested deviation in natural language",
+            deviation_requested=False,
+            deviation_reason=None,
         )
 
     async def fake_verify_execution_async(**_kwargs: object) -> object:
@@ -699,6 +714,8 @@ async def test_plan_mode_deviation_review_resume_actions_update_state(
             execution_log=[],
             evidence=[],
             final_result="executor done",
+            deviation_requested=True,
+            deviation_reason="Need to inspect logs before editing config.",
         )
 
     async def fake_verify_execution_async(**_kwargs: object) -> object:
@@ -731,8 +748,6 @@ async def test_plan_mode_deviation_review_resume_actions_update_state(
         {
             "mode": "plan",
             "messages": [HumanMessage(content="hello")],
-            "deviation_requested": True,
-            "deviation_reason": "Need to inspect logs before editing config.",
         },
         config=config,
     )
@@ -841,6 +856,8 @@ async def test_plan_executor_delegates_hitl_installation_to_deep_agent(monkeypat
             execution_log=[],
             evidence=[],
             final_result="executor done",
+            deviation_requested=False,
+            deviation_reason=None,
         )
 
     monkeypatch.setattr("fsagent.runtime.graph.HumanInTheLoopMiddleware", SentinelHumanInTheLoopMiddleware)
@@ -947,6 +964,81 @@ async def test_plan_executor_ignores_unexpected_write_todos_tool_call():
     assert "Unknown tools are denied by default" not in final_result["final_response"]
     assert final_result["todos"][0]["status"] == "completed"
     assert final_result["execution_log"][0]["result"] == "执行完成"
+
+
+async def test_planner_repo_rules_helper_extracts_rules_from_system_prompt(monkeypatch):
+    """Test that _planner_repo_rules extracts repo rules from system prompt."""
+    # Test 1: Pure rules text - should return as-is
+    pure_rules = "默认使用中文回答。遵循项目代码规范。"
+    assert _planner_repo_rules(pure_rules) == pure_rules
+
+    # Test 2: AGENTS.md format - should extract only rules sections
+    agents_md_content = """# AGENTS.md
+
+本文件适用于项目目录及其子目录。
+
+## 语言与沟通
+
+- 默认使用中文回答问题。
+- 说明变更时保持简洁。
+
+## 项目定位
+
+- 本项目是 Deep Agents 的扩展。
+
+## Python 开发
+
+- 需要 Python >=3.11。
+- 使用 uv 管理依赖。
+"""
+    extracted_rules = _planner_repo_rules(agents_md_content)
+    assert extracted_rules is not None
+    assert "默认使用中文回答问题" in extracted_rules
+    assert "需要 Python >=3.11" in extracted_rules
+    assert "# AGENTS.md" not in extracted_rules
+    assert "本文件适用于项目目录" not in extracted_rules
+
+    # Test 3: Use monkeypatch to verify the helper is called during planner invocation
+    captured_repo_rules = []
+
+    def capture_repo_rules(system_prompt: str | SystemMessage | None) -> str | None:
+        result = _planner_repo_rules(system_prompt)
+        captured_repo_rules.append(result)
+        return result
+
+    monkeypatch.setattr("fsagent.runtime.graph._planner_repo_rules", capture_repo_rules)
+
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "分析输入", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    repo_rules = "默认使用中文回答。遵循项目代码规范。"
+    runtime = create_runtime(model=model, system_prompt=repo_rules, no_mcp=True)
+
+    result = await runtime.ainvoke(
+        {"mode": "plan", "messages": [HumanMessage(content="分析项目")]},
+        config={"configurable": {"thread_id": "thread-1"}},
+    )
+
+    assert "__interrupt__" in result
+    assert len(captured_repo_rules) == 1
+    assert captured_repo_rules[0] == repo_rules
+    first_model_call = "\n".join(str(message.content) for message in model.call_messages[0])
+    assert "[trusted:repo_rules]" in first_model_call
+    assert "默认使用中文回答" in first_model_call
 
 
 class _ToolBindingFakeChatModel(BaseChatModel):
