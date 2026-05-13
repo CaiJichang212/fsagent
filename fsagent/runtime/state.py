@@ -31,6 +31,7 @@ class PlanMeta(TypedDict):
     goal: str
     assumptions: NotRequired[list[str]]
     final_output_format: NotRequired[str]
+    verification: NotRequired[list[str]]
 
 
 class ExecutionLogEntry(TypedDict):
@@ -121,6 +122,9 @@ class RuntimeState(PlanningState):
     plan_meta: NotRequired[PlanMeta | None]
     plan_review_count: NotRequired[int]
     plan_feedback: NotRequired[str | None]
+    mcp_review_approved: NotRequired[bool]
+    deviation_requested: NotRequired[bool]
+    deviation_reason: NotRequired[str]
     fast_tool_round_used: NotRequired[bool]
     fsagent_todo_index: NotRequired[int]
     fsagent_todo_content: NotRequired[str]
