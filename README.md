@@ -1,35 +1,33 @@
 # fsagent
 
-`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供 FastAPI 服务和 React 前端，用于在同一套 LangGraph runtime 上运行快速问答或可审核计划执行流程。
+`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供 FastAPI 服务与 React 前端，在同一套 LangGraph runtime 上支持快速问答和可审核的计划执行流程。
 
-## 功能概览
+## 核心能力
 
-- **Fast 模式**：直接调用 Deep Agents 风格 agent，适合一次性快速任务。
-- **Plan 模式**：先生成 todo 计划，等待用户审核后再逐项执行，并输出执行摘要。
-- **通用审核模型**：计划审核兼容旧 `/review` 端点；工具、偏离计划和 MCP 审核共用 `pendingReview` / `reviews` contract。
-- **Session Store**：默认使用内存 store，提供 JSONL store 作为本地 snapshot 恢复适配；服务重启后可查询 API snapshot，但跨进程 runtime resume 尚未实现。`FSAGENT_CHECKPOINTER_PATH` 目前只读取并记录 checkpoint reference，真实 SQLite/Postgres saver 仍 planned。
-- **工具策略**：内置 `dev-default`、`locked-down`、`ci-eval` profile，高风险工具进入审核，未知工具默认拒绝。
-- **验证与证据报告**：Todo、执行日志、证据、产物、工具调用和 verification 都有稳定 ID，最终报告包含验证结果或跳过原因。
-- **HTTP API + SSE**：前端可通过普通请求或事件流获取 session、timeline、todo、review、tool call、evidence 和执行日志。
-- **模型配置**：通过 `.env` 和 `model_config.json` 管理模型、thinking 开关和采样参数。
-- **MCP 工具加载**：默认安全关闭；只有显式启用并信任项目 MCP 时才会加载 stdio MCP server。
-- **Slash 模式路由**：`/fast ...` 和 `/plan ...` 可在接入层显式选择运行模式，解析逻辑独立在 `fsagent.slash_router`。
+- `fast` 模式：直接执行单次任务，适合快速问答、仓库检查等一次性请求。
+- `plan` 模式：先生成 todo 计划，等待用户审核后再执行，并产出最终报告。
+- 通用 review 模型：plan、tool、deviation、MCP 共用 `pendingReview` / `reviews` 数据结构。
+- 会话快照：支持内存 store 和 JSONL store；服务重启后可恢复 API snapshot。
+- 工具策略：内置 `dev-default`、`locked-down`、`ci-eval` 三套 profile。
+- 验证记录：Plan 执行可附带验证命令，结果写入 `verification` 并进入最终报告。
+- HTTP + SSE：创建 run、审核 review、读取 session 都可走普通请求或流式接口。
+- 显式模式路由：`/fast ...` 与 `/plan ...` 由 `fsagent.slash_router` 统一解析。
 
 ## 目录结构
 
 ```text
 .
 ├── fsagent/
-│   ├── dev.py                 # API + 前端开发启动器：fsagent-dev
-│   ├── slash_router.py        # /fast 和 /plan 显式模式路由
 │   ├── api/                   # FastAPI schema、server、session service
-│   ├── runtime/               # Fast/Plan runtime、planner、executor、MCP、模型配置
-│   └── tests/                 # Python 单元测试
-├── frontend/                  # Vite + React + TypeScript 前端和脚本级测试
-├── docs/                      # 设计说明、执行计划和测试记录
-├── scripts/start-dev.sh       # 一键启动后端和前端
-├── model_config.json          # 前端可选模型和采样配置
-├── pyproject.toml             # Python 包、脚本和测试依赖配置
+│   ├── runtime/               # Fast/Plan runtime、planner、executor、policy、MCP、verification
+│   ├── tests/                 # Python 单元测试
+│   ├── dev.py                 # API + 前端开发启动器：fsagent-dev
+│   └── slash_router.py        # /fast 和 /plan 模式路由
+├── frontend/                  # Vite + React + TypeScript 前端
+├── docs/                      # 设计说明和测试记录
+├── scripts/start-dev.sh       # 一键启动脚本
+├── model_config.json          # 前端可选模型目录
+├── pyproject.toml             # Python 包、脚本和测试依赖
 └── mcp.json                   # 本地 MCP 配置，默认被 .gitignore 忽略
 ```
 
@@ -37,40 +35,37 @@
 
 - Python `>=3.11,<4.0`
 - `uv`
-- Node.js 和 npm
+- Node.js 与 npm
 
-本项目位于 monorepo 的 `harnessagents/fsagent/` 目录，`pyproject.toml` 中的 `deepagents` 与 `deepagents-cli` 依赖指向相邻的 `../../libs/` 源码。
+本项目位于 monorepo 的 `harnessagents/fsagent/` 目录，`pyproject.toml` 中的 `deepagents` 与 `deepagents-cli` 依赖指向相邻的 `../../libs/` 源码目录。
 
 ## 安装
 
-在项目目录中安装后端依赖：
+在 `harnessagents/fsagent/` 目录执行：
 
 ```bash
 uv sync
+cd frontend
+npm install
 ```
 
 如果当前目录在 monorepo 根目录：
 
 ```bash
 uv sync --project harnessagents/fsagent
-```
-
-安装前端依赖：
-
-```bash
-cd frontend
+cd harnessagents/fsagent/frontend
 npm install
 ```
 
 ## 配置
 
-复制示例配置并填写真实密钥：
+复制示例配置：
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` 支持以下变量：
+常用环境变量：
 
 ```bash
 MODEL=Qwen/Qwen3.5-27B
@@ -79,44 +74,51 @@ API_KEY=xxx
 AVAILABLE_MODELS_JSON=model_config.json
 FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
 FSAGENT_CHECKPOINTER_PATH=logs/fsagent-checkpoints.sqlite
+FSAGENT_LOG_LEVEL=INFO
+FSAGENT_LOG_FILE=logs/fsagent-api.jsonl
 ```
 
 说明：
 
-- `MODEL`：默认模型名称，可被 API 请求覆盖。
-- `BASE_URL`：OpenAI-compatible 模型服务地址。
-- `API_KEY`：模型服务密钥；不要提交真实值。
+- `MODEL`、`BASE_URL`、`API_KEY`：默认模型与 OpenAI-compatible 服务配置，均可被 API 请求覆盖。
 - `AVAILABLE_MODELS_JSON`：模型目录配置，默认读取项目根目录的 `model_config.json`。
-- `FSAGENT_SESSION_STORE_PATH`：可选。设置后 API 使用 JSONL session store 保存 snapshot；未设置时使用内存 store。
-- `FSAGENT_CHECKPOINTER_PATH`：可选。当前仅作为 checkpoint reference 配置被读取和记录，不会启用完整 LangGraph 持久化恢复。
+- `FSAGENT_SESSION_STORE_PATH`：设置后启用 `JsonlSessionStore`；未设置时使用 `InMemorySessionStore`。
+- `FSAGENT_CHECKPOINTER_PATH`：当前只作为 checkpoint reference 被记录，不会自动启用完整的 LangGraph 持久化恢复。
+- `FSAGENT_LOG_LEVEL`、`FSAGENT_LOG_FILE`：控制 JSONL 日志级别与输出位置。
 
-日志相关变量：
-
-- `FSAGENT_LOG_LEVEL`：日志级别，未设置时后端默认为 `INFO`；`./scripts/start-dev.sh` 默认设为 `DEBUG`。
-- `FSAGENT_LOG_FILE`：可选 JSONL 日志路径；启动脚本默认写入 `logs/fsagent-api.jsonl`。
-
-## 运行方式
+## 运行
 
 ### 一键开发启动
 
-推荐使用根目录脚本同时启动 API 与前端：
+推荐使用根目录脚本：
 
 ```bash
 ./scripts/start-dev.sh
 ```
+
+该脚本会默认设置：
+
+- `FSAGENT_LOG_LEVEL=DEBUG`
+- `FSAGENT_LOG_FILE=logs/fsagent-api.jsonl`
+- `uv run fsagent-dev --auto-kill`
 
 默认地址：
 
 - API：`http://127.0.0.1:8000`
 - 前端：`http://127.0.0.1:5173`
 
-可通过启动器参数覆盖地址或跳过检查：
+### 使用启动器
 
 ```bash
 uv run fsagent-dev --host 127.0.0.1 --api-port 8000 --frontend-port 5173
 uv run fsagent-dev --skip-deps
 uv run fsagent-dev --auto-kill
 ```
+
+`fsagent-dev` 会先检查端口占用和前后端依赖，再分别启动：
+
+- API：`uv run uvicorn fsagent.api.server:app --reload --no-access-log`
+- Frontend：`npm run dev`
 
 ### 单独启动 API
 
@@ -137,40 +139,40 @@ cd frontend
 npm run dev
 ```
 
-前端 Vite 代理会把 `/api` 转发到 `FSAGENT_API_TARGET`，未设置时默认代理到 `http://127.0.0.1:8000`。
+前端会把 `/api` 代理到 `FSAGENT_API_TARGET`；未设置时默认代理到 `http://127.0.0.1:8000`。
 
 ## Slash 模式路由
 
-`fsagent.slash_router.parse_slash_mode` 用于把上层输入显式路由到运行模式：
+`fsagent.slash_router.parse_slash_mode` 只接受带正文的 `/fast ...` 或 `/plan ...`：
 
 ```text
 /fast 快速检查当前改动
 /plan 为 README 更新制定并执行计划
 ```
 
-解析规则：
+不符合格式时会抛出：
 
-- 只接受 `/fast ` 或 `/plan ` 前缀，且前缀后必须有正文。
-- 返回 `mode` 和去掉前缀后的 `content`。
-- 不符合格式时抛出 `ValueError("Please start your request with /fast or /plan.")`。
+```text
+ValueError("Please start your request with /fast or /plan.")
+```
 
-## API
+## API 概览
 
-FastAPI 应用标题为 `fsagent API`。主要接口：
+FastAPI 应用标题为 `fsagent API`，主要接口如下：
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/health` | 健康检查 |
-| `GET` | `/api/model-config` | 获取前端模型选择配置 |
-| `POST` | `/api/runs` | 创建并执行 Fast/Plan run |
-| `POST` | `/api/runs/stream` | 创建 run，并通过 SSE 返回 session 快照 |
-| `GET` | `/api/runs/{sessionId}` | 获取已有 session |
-| `POST` | `/api/runs/{sessionId}/review` | 审核 Plan run |
-| `POST` | `/api/runs/{sessionId}/review/stream` | 审核 Plan run，并通过 SSE 返回增量快照 |
-| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision` | 提交通用 review 决策 |
-| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision/stream` | 提交通用 review 决策，并通过 SSE 返回增量快照 |
+| 方法   | 路径                                                       | 说明                                   |
+| ------ | ---------------------------------------------------------- | -------------------------------------- |
+| `GET`  | `/api/health`                                              | 健康检查                               |
+| `GET`  | `/api/model-config`                                        | 读取前端模型目录                       |
+| `POST` | `/api/runs`                                                | 创建并执行 Fast/Plan run               |
+| `POST` | `/api/runs/stream`                                         | 创建 run，并通过 SSE 推送 session 快照 |
+| `GET`  | `/api/runs/{sessionId}`                                    | 获取已有 session                       |
+| `POST` | `/api/runs/{sessionId}/review`                             | 处理 plan review                       |
+| `POST` | `/api/runs/{sessionId}/review/stream`                      | 流式处理 plan review                   |
+| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision`        | 处理通用 review 决策                   |
+| `POST` | `/api/runs/{sessionId}/reviews/{reviewId}/decision/stream` | 流式处理通用 review 决策               |
 
-创建 run 的请求示例：
+创建 run 示例：
 
 ```json
 {
@@ -188,9 +190,7 @@ FastAPI 应用标题为 `fsagent API`。主要接口：
 }
 ```
 
-`toolPolicyProfile` 可选值为 `dev-default`、`locked-down`、`ci-eval`。省略时使用 runtime 解析出的默认值；传入未知 profile 会被拒绝，不再回退到 `dev-default`。
-
-Plan 审核请求示例：
+Plan review 示例：
 
 ```json
 {
@@ -198,14 +198,7 @@ Plan 审核请求示例：
 }
 ```
 
-可选 `action`：
-
-- `approve`：批准计划并开始执行。
-- `edit`：提交修改后的 `todos` 和可选 `planMeta`。编辑时会保留原始计划中的 `verification` 建议字段。
-- `retry`：带 `feedback` 重新生成计划。
-- `cancel`：取消 session，可带 `reason`。
-
-通用 review 决策请求示例：
+通用 review decision 示例：
 
 ```json
 {
@@ -214,14 +207,11 @@ Plan 审核请求示例：
 }
 ```
 
-Plan review 支持 `approve`、`edit`、`retry`、`cancel`；tool review 支持 `approve`、`modify`、`deny`、`cancel`；deviation review 支持 `approve`、`replan`、`cancel`；MCP review 支持 `approve`、`deny`、`cancel`。旧 `/review` 端点仍作为 plan-review shorthand 保留。
+说明：
 
-## Review 行为说明
-
-- **Plan review edit**：编辑时会保留原始计划中的 `verification` 建议字段。
-- **Deviation review**：由 executor 显式请求触发，当执行过程中需要偏离已批准的计划时发起。
-- **MCP / Deviation review subject**：保留结构化字段，deviation review 的 subject 包含 `source`、`summary`、`reason`；MCP review 的 subject 包含 `servers` 列表。
-- **Parsed-only backend profiles**：`sandbox-exec` 和 `store-backed` 会发出 `runtime.profile_warning` timeline event。
+- `ReviewRequest.action` 支持 `approve`、`edit`、`retry`、`cancel`。
+- `ReviewDecisionRequest.action` 支持 `approve`、`edit`、`retry`、`cancel`、`modify`、`deny`、`replan`、`respond`。
+- 如果 session snapshot 仍在，但运行时 checkpoint 已缺失，review/resume 接口会返回 `409 Runtime checkpoint missing for session.`。
 
 ## Runtime 工作流
 
@@ -231,55 +221,115 @@ Plan review 支持 `approve`、`edit`、`retry`、`cancel`；tool review 支持 
   └── Plan 模式 -> planner -> plan_review -> executor -> verifier -> formatter -> final_response
 ```
 
-Plan 模式的最终报告包含：
+Plan 模式下：
 
-- `Result`
-- `Execution Summary`
-- `Plan Status`
-- `Artifacts And Evidence`
-- `Evidence`
-- `Verification`
+- planner 只生成计划草案，不执行普通工具或 MCP 执行工具。
+- executor 在计划获批后执行 todo，并记录 `toolCalls`、`artifacts`、`evidence`、`executionLog`。
+- verifier 负责执行允许的验证命令并生成 `verification` 记录。
+- formatter 产出最终报告，通常包含 `Result`、`Execution Summary`、`Plan Status`、`Artifacts And Evidence`、`Evidence`、`Verification`。
 
-`completed` 只应在 verification 通过，或记录了明确的 skipped/manual verification reason 后出现。verification 失败时 session 可进入 `needs_revision`。
+## Review 与 Session
 
-### Runtime Profiles
+`SessionResponse` 会暴露完整前端快照，包括：
 
-`profile`、`backendProfile`、`permissionProfile` 和 `toolPolicyProfile` 由 fsagent runtime 在创建 Fast/Plan 图之前解析。未知的 profile 名称会被拒绝。`workspace-readonly` 通过 Deep Agents 文件系统权限拒绝文件写入，并选择 locked-down 工具策略。
+- `todos`
+- `planMeta`
+- `executionLog`
+- `timeline`
+- `pendingReview`
+- `reviews`
+- `toolCalls`
+- `artifacts`
+- `evidence`
+- `verification`
+- `finalResponse`
 
-`backendProfile` 接受 `ephemeral`、`workspace-readonly`、`workspace-edit`、`sandbox-exec` 和 `store-backed`。`sandbox-exec` 和 `store-backed` 目前仅为解析状态：API 接受它们以保持向前兼容，但尚未由生产运行时完全支持。请求这些 profile 的会话会发出明确的 `runtime.profile_warning` timeline 事件，而不是静默接受仅解析的选择。
+Review 类型包括：
 
-### Verification
+- `plan_review`：审核或修改计划。
+- `tool_review`：高风险工具调用审批。
+- `deviation_review`：执行阶段需要偏离已批准计划时触发。
+- `mcp_review`：启用或调用 MCP server 时的审核。
 
-Plan 模式为每次完成的运行记录验证。当计划提供白名单内的验证命令时，fsagent 可以执行它们并存储摘要的 `VerificationRecord` 条目。非白名单命令会被跳过并给出明确原因。
+`edit` 计划时会保留原始 `planMeta.verification` 建议字段。
 
-### Persistence
+## Profile 与工具策略
 
-JSONL session store 是本地快照存储。它在进程重启间保留 API 快照，但运行时恢复仍需要活跃的 LangGraph checkpoint，除非配置了持久化 checkpointer。
+### Runtime 组装参数
 
-当前实现说明：`FSAGENT_CHECKPOINTER_PATH` 只记录 checkpoint 引用；它尚未实例化持久化 LangGraph saver，因此跨进程运行时恢复仍然是部分/计划中的。
+创建 run 时可传入：
 
-## Session 与持久化
+- `profile`
+- `backendProfile`
+- `permissionProfile`
+- `toolPolicyProfile`
 
-API snapshot 包含 `pendingReview`、`reviews`、`toolCalls`、`artifacts`、`evidence` 和 `verification`。未设置 `FSAGENT_SESSION_STORE_PATH` 时，`InMemorySessionStore` 保持默认行为；设置该路径后，API 使用 `JsonlSessionStore` 本地保存和重载 session snapshot。注意：JSONL store 只保存 API snapshot 和 resume metadata，不保存 LangGraph runtime/checkpoint 本体；`FSAGENT_CHECKPOINTER_PATH` 目前也只是配置和引用记录，不会启用完整持久化恢复。如果服务重启后缺少 runtime checkpoint，`GET /api/runs/{sessionId}` 仍可返回 snapshot，但 review/resume 会返回 `409 Runtime checkpoint missing for session.`。
+支持值：
 
-## 默认工具策略
+- `profile`：`dev-default`、`locked-down`、`ci-eval`
+- `backendProfile`：`ephemeral`、`workspace-readonly`、`workspace-edit`、`sandbox-exec`、`store-backed`
+- `permissionProfile`：`workspace-readonly`、`workspace-edit`、`locked-down`、`ci-eval`
+- `toolPolicyProfile`：`dev-default`、`locked-down`、`ci-eval`
 
-默认 profile 为 `dev-default`：
+说明：
 
-| 工具类型 | 风险 | 默认行为 |
-| --- | --- | --- |
-| `ls`、`glob`、`grep`、`read_file` | low | 允许并记录摘要 |
-| `write_file`、`edit_file` | medium | 仅在 executor 阶段允许 |
-| `execute`、`bash`、`shell` | high | 进入 tool review |
-| `task` | medium | executor 阶段允许并记录摘要 |
-| MCP 工具 | medium/high | MCP 启用后按 metadata 和 profile 处理 |
-| Unknown tools | high | 默认拒绝 |
+- 未知 profile 会被直接拒绝，不会静默回退。
+- `workspace-readonly`、`locked-down`、`ci-eval` 会通过文件系统权限拒绝写入。
+- `sandbox-exec` 与 `store-backed` 当前仅完成参数解析，会发出 `runtime.profile_warning` timeline 事件，但还没有完整生产运行时支持。
 
-`locked-down` 只直接允许只读工具，其余写入、执行、MCP、subtask 工具需要 review 或被拒绝；`ci-eval` 只允许确定性的只读工具，拒绝有副作用的工具。
+### 默认工具策略
+
+`dev-default` 的行为如下：
+
+| 工具类型   | 示例                              | 默认行为             |
+| ---------- | --------------------------------- | -------------------- |
+| 只读工具   | `ls`、`glob`、`grep`、`read_file` | 允许                 |
+| 写入工具   | `write_file`、`edit_file`         | 仅 executor 阶段允许 |
+| 执行工具   | `execute`、`bash`、`shell`        | 进入 review          |
+| 子任务工具 | `task`                            | 仅 executor 阶段允许 |
+| 未知工具   | -                                 | 默认拒绝             |
+
+补充说明：
+
+- `locked-down` 只直接放行只读工具，其余大多要求 review 或被拒绝。
+- `ci-eval` 只允许确定性的只读工具，拒绝有副作用工具。
+- MCP 工具在启用后仍会按 metadata 风险和 profile 继续判定。
+
+## 持久化与恢复
+
+当前持久化能力分为两层：
+
+- session store：保存 API snapshot 和 resume metadata。
+- checkpoint reference：记录 checkpoint 路径引用。
+
+当前实现限制：
+
+- `FSAGENT_SESSION_STORE_PATH` 启用的 JSONL store 可以在服务重启后恢复 session snapshot。
+- JSONL store 不保存 LangGraph runtime/checkpoint 本体。
+- `FSAGENT_CHECKPOINTER_PATH` 目前不会实例化持久化 saver，只记录引用信息。
+- 因此，服务重启后 `GET /api/runs/{sessionId}` 仍可能成功，但 review/resume 依然可能因缺失 runtime checkpoint 而失败。
+
+## Verification
+
+Plan 模式支持执行白名单内的验证命令，当前允许的前缀为：
+
+```text
+uv run --group test pytest
+uv run --group test ruff check
+uv run --group test ruff format
+npm run build
+```
+
+行为说明：
+
+- 非白名单命令不会执行，而是记录为 `skipped`，原因是 `Verification command is not allowlisted.`。
+- 单条命令默认超时为 120 秒。
+- 输出只保留摘要，不保存完整日志正文。
+- verification 失败时，session 可进入 `needs_revision`，而不是直接标记为 `completed`。
 
 ## MCP 安全说明
 
-MCP 默认不加载。`mcp.json` 是本地配置文件，默认被 `.gitignore` 忽略，可能包含本地命令、私有 server 或密钥；不要提交包含真实 token 的 MCP 配置。API 请求中需要设置：
+MCP 默认关闭。启用时至少需要：
 
 ```json
 {
@@ -288,7 +338,7 @@ MCP 默认不加载。`mcp.json` 是本地配置文件，默认被 `.gitignore` 
 }
 ```
 
-HTTP、streamable HTTP 和 SSE server 会按配置加载；对于会启动本地进程的 stdio MCP server，还必须显式信任项目配置：
+如果配置中包含会启动本地进程的 stdio MCP server，还必须显式信任项目配置：
 
 ```json
 {
@@ -296,54 +346,37 @@ HTTP、streamable HTTP 和 SSE server 会按配置加载；对于会启动本地
 }
 ```
 
-不要在未确认 MCP 配置可信时启用项目 stdio MCP server。
+注意：
+
+- `mcp.json` 默认被 `.gitignore` 忽略，可能包含本地命令、私有 server 或密钥。
+- 未确认配置可信前，不要开启项目级 stdio MCP server。
 
 ## 日志
 
-后端日志使用 JSON Lines 格式，覆盖 HTTP 请求、session 生命周期、Fast/Plan agent 模型轮次、工具调用摘要、Plan 审核、planner/executor 进度和异常 traceback。可通过环境变量调整日志级别和输出位置：
+后端日志为 JSON Lines 格式，覆盖 HTTP 请求、session 生命周期、agent 轮次、工具调用摘要、review 流程和异常信息。
+
+示例：
 
 ```bash
 FSAGENT_LOG_LEVEL=DEBUG FSAGENT_LOG_FILE=logs/fsagent-api.jsonl ./scripts/start-dev.sh
 ```
 
-未设置 `FSAGENT_LOG_FILE` 时，日志输出到 stdout。`./scripts/start-dev.sh` 默认导出 `FSAGENT_LOG_LEVEL=DEBUG` 和 `FSAGENT_LOG_FILE=logs/fsagent-api.jsonl`，调用时显式传入的同名环境变量优先。
+说明：
 
-细粒度 agent 事件统一使用 `agent.*` 前缀，并通过 `agent_mode` 与 `phase` 区分 Fast、Plan planner 和 Plan executor。Plan 模式中，planner 在审核前只生成计划草案并写入 `write_todos`，不加载普通工具或 MCP 执行工具；用户批准后才由 executor 调用执行工具。例如：
-
-```json
-{"event":"agent.tool.completed","agent_mode":"plan","phase":"executor","tool_name":"read_file","duration_ms":18.4,"result_size_chars":2048}
-{"event":"agent.tool.completed","agent_mode":"plan","phase":"planner","tool_name":"write_todos","duration_ms":3.1,"result_size_chars":128}
-```
-
-默认只记录摘要和元数据，包括工具名、参数 key、输入/输出长度、耗时和错误类型；不会记录完整 prompt、工具参数值或工具结果正文。常用排障命令：
-
-```bash
-tail -f logs/fsagent-api.jsonl
-rg '"event":"agent.tool.failed"|"event":"agent.model.failed"' logs/fsagent-api.jsonl
-rg '"session_id":"<session-id>"' logs/fsagent-api.jsonl
-```
+- 未设置 `FSAGENT_LOG_FILE` 时，日志输出到 stdout。
+- `agent.*` 事件会通过 `agent_mode` 与 `phase` 区分 `fast_runner`、`planner`、`executor`。
+- 默认只记录摘要与元数据，不记录完整 prompt、工具参数正文或工具返回正文。
 
 ## 测试与质量检查
 
-在项目目录运行：
+在 `harnessagents/fsagent/` 目录运行：
 
 ```bash
 uv run --group test pytest fsagent/tests -q
 uv run --group test ruff check fsagent
 uv run --group test ruff format fsagent --diff
-```
-
-前端构建：
-
-```bash
 cd frontend
 npm run build
-```
-
-前端脚本级测试：
-
-```bash
-cd frontend
 node --test tests/*.test.mjs
 npm exec -- playwright test --config playwright.controlled-replay.config.mjs
 ```
@@ -356,13 +389,11 @@ uv run --project harnessagents/fsagent --group test pytest harnessagents/fsagent
 
 ## 开发约定
 
-- 后端公共入口：
-  - API：`fsagent.api.server:main`
-  - 开发启动器：`fsagent.dev:main`
-- Runtime 行为变更优先补充 `fsagent/tests/` 中的对应测试。
-- API schema、session 状态或 runtime 输出变化时，重点检查 `test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py`。
-- 开发启动器变化时，重点检查 `test_dev.py`。
-- 模型配置逻辑变化时，重点检查 `test_model_config.py`。
-- Slash 模式路由变化时，重点检查 `test_slash_router.py`。
-- 前端 review、timeline、markdown、controlled replay 行为变化时，重点检查 `frontend/tests/` 中对应脚本。
+- API 入口：`fsagent.api.server:main`
+- 开发启动器入口：`fsagent.dev:main`
+- 变更 runtime 行为时，优先补充 `fsagent/tests/` 对应测试。
+- 变更 API schema、session 状态或 runtime 输出时，优先检查 `test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py`。
+- 变更开发启动器时，优先检查 `test_dev.py`。
+- 变更模型配置逻辑时，优先检查 `test_model_config.py`。
+- 变更 slash 模式路由时，优先检查 `test_slash_router.py`。
 - 不要提交真实 `.env`、API Key、令牌或本地私密配置。
