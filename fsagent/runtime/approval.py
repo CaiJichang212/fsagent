@@ -59,6 +59,9 @@ def normalize_plan_meta(plan_meta: Mapping[str, Any] | None, *, default_goal: st
     output_format = plan_meta.get("final_output_format")
     if output_format is not None:
         normalized["final_output_format"] = str(output_format)
+    verification = plan_meta.get("verification")
+    if isinstance(verification, list):
+        normalized["verification"] = [str(item).strip() for item in verification if str(item).strip()]
     return normalized
 
 
