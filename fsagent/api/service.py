@@ -36,6 +36,7 @@ from fsagent.api.schemas import (
     VerificationRecord,
 )
 from fsagent.observability import RunLogContext, RunLogger, get_logger
+from fsagent.runtime.assembly import RuntimeAssemblyConfig, resolve_runtime_assembly
 from fsagent.runtime.graph import create_runtime
 from fsagent.runtime.model_config import FsAgentEnv, build_chat_qwen, resolve_thinking_enabled
 from fsagent.runtime.policy import evaluate_tool_policy
@@ -87,10 +88,12 @@ class FsAgentApiService:
         runtime_factory: RuntimeFactory | None = None,
         *,
         session_store: SessionStore | None = None,
+        checkpoint_ref: str | None = None,
     ) -> None:
         """Initialize the service with an optional runtime factory."""
         self._runtime_factory = runtime_factory or self._default_runtime_factory
         self._session_store = session_store or InMemorySessionStore()
+        self._checkpoint_ref = checkpoint_ref
         self._sessions: dict[str, SessionRecord] = {}
 
     async def create_run(self, request: RunRequest) -> SessionResponse:
@@ -283,6 +286,7 @@ class FsAgentApiService:
         model = request.model or base_env.model
         env = _env_for_model(base_env, model)
         thinking = resolve_thinking_enabled(env, requested=request.thinking)
+        assembly = _runtime_assembly_for_request(request)
         session = SessionResponse(
             sessionId=session_id,
             threadId=thread_id,
@@ -321,7 +325,8 @@ class FsAgentApiService:
             runtime=runtime,
             config={
                 "configurable": {"thread_id": thread_id},
-                "metadata": {"tool_policy_profile": request.tool_policy_profile or "dev-default"},
+                "metadata": {"tool_policy_profile": assembly.tool_policy_profile},
+                "checkpoint_ref": self._checkpoint_ref or thread_id,
             },
             logger=run_logger,
         )
@@ -384,6 +389,10 @@ class FsAgentApiService:
             fallback=record.session.execution_log,
         )
         record.session.tool_calls = _tool_calls(result.get("tool_calls"), fallback=record.session.tool_calls)
+        record.session.execution_log = _link_execution_logs_to_tool_calls(
+            record.session.execution_log,
+            record.session.tool_calls,
+        )
         record.session.artifacts = _artifacts(result.get("artifacts"), fallback=record.session.artifacts)
         record.session.evidence = _evidence(result.get("evidence"), fallback=record.session.evidence)
         record.session.verification = _verification(result.get("verification"), fallback=record.session.verification)
@@ -418,9 +427,16 @@ class FsAgentApiService:
             )
         tool_call_updates = event.get("tool_calls")
         if "tool_calls" in event or _is_agent_tool_lifecycle_event(kind):
+            todo_id = _todo_id_from_event(event, record.session.todos) if _is_agent_tool_lifecycle_event(kind) else None
             record.session.tool_calls = _tool_calls(
-                tool_call_updates if isinstance(tool_call_updates, list) else _tool_calls_from_lifecycle_event(event),
+                tool_call_updates
+                if isinstance(tool_call_updates, list)
+                else _tool_calls_from_lifecycle_event(event, todo_id=todo_id),
                 fallback=record.session.tool_calls,
+            )
+            record.session.execution_log = _link_execution_logs_to_tool_calls(
+                record.session.execution_log,
+                record.session.tool_calls,
             )
         if "artifacts" in event:
             record.session.artifacts = _artifacts(event.get("artifacts"), fallback=record.session.artifacts)
@@ -535,14 +551,25 @@ class FsAgentApiService:
         env = FsAgentEnv.from_sources()
         if request.model:
             env = _env_for_model(env, request.model)
+        assembly = _runtime_assembly_for_request(request)
         return create_runtime(
             model=build_chat_qwen(env, thinking=request.thinking),
             checkpointer=checkpointer,
             mcp_config_path=request.mcp_config_path if request.mcp_enabled else None,
             no_mcp=not request.mcp_enabled,
             trust_project_mcp=request.trust_project_mcp,
-            tool_policy_profile=request.tool_policy_profile or "dev-default",
+            tool_policy_profile=assembly.tool_policy_profile,
+            permissions=assembly.permissions,
         )
+
+
+def _runtime_assembly_for_request(request: RunRequest) -> RuntimeAssemblyConfig:
+    return resolve_runtime_assembly(
+        profile=request.profile,
+        backend_profile=request.backend_profile,
+        permission_profile=request.permission_profile,
+        tool_policy_profile=request.tool_policy_profile,
+    )
 
 
 def _env_for_model(env: FsAgentEnv, model: str) -> FsAgentEnv:
@@ -558,10 +585,11 @@ def _env_for_model(env: FsAgentEnv, model: str) -> FsAgentEnv:
 def _store_record(record: SessionRecord) -> SessionStoreRecord:
     configurable = record.config.get("configurable")
     runtime_config = dict(configurable) if isinstance(configurable, Mapping) else {}
+    checkpoint_ref = record.config.get("checkpoint_ref")
     return SessionStoreRecord(
         session=record.session,
         runtime_config=runtime_config,
-        checkpoint_ref=str(runtime_config.get("thread_id")) if runtime_config.get("thread_id") else None,
+        checkpoint_ref=str(checkpoint_ref or runtime_config.get("thread_id") or ""),
     )
 
 
@@ -870,7 +898,20 @@ def _resume_payload_for_review(review: ReviewRecord, request: ReviewDecisionRequ
         return {}
     if review.kind == "plan_review":
         return _plan_resume_payload(request)
+    if review.kind in {"mcp_review", "deviation_review"}:
+        return _gate_resume_payload(request)
     return {"decisions": _tool_resume_decisions(review, request)}
+
+
+def _gate_resume_payload(request: ReviewDecisionRequest) -> dict[str, object]:
+    payload: dict[str, object] = {"action": request.action}
+    if request.reason:
+        payload["reason"] = request.reason
+    if request.feedback:
+        payload["feedback"] = request.feedback
+    if request.edited_subject is not None:
+        payload["editedSubject"] = request.edited_subject
+    return payload
 
 
 def _plan_resume_payload(request: ReviewDecisionRequest) -> dict[str, object]:
@@ -1064,9 +1105,7 @@ def _todos(value: object, *, fallback: list[TodoItem] | None = None) -> list[Tod
         if not isinstance(item, Mapping):
             continue
         status = str(item.get("status") or "pending")
-        if status == "blocked":
-            status = "failed"
-        if status not in {"pending", "in_progress", "completed", "failed"}:
+        if status not in {"pending", "in_progress", "completed", "failed", "blocked"}:
             status = "pending"
         risk = str(item.get("risk") or "low")
         if risk not in {"low", "medium", "high", "critical"}:
@@ -1089,10 +1128,14 @@ def _todos(value: object, *, fallback: list[TodoItem] | None = None) -> list[Tod
 def _plan_meta(value: object) -> PlanMeta | None:
     if not isinstance(value, Mapping):
         return None
+    verification = value.get("verification")
     return PlanMeta(
         goal=str(value.get("goal") or ""),
         assumptions=[str(item) for item in value.get("assumptions") or []],
         final_output_format=value.get("final_output_format") or value.get("finalOutputFormat"),
+        verification=[str(item).strip() for item in verification if str(item).strip()]
+        if isinstance(verification, list)
+        else [],
     )
 
 
@@ -1105,14 +1148,12 @@ def _execution_log(
     if not isinstance(value, list):
         return fallback or []
     entries = []
-    todo_id_by_content = {todo.content: todo.id for todo in todos or [] if todo.id}
+    todo_id_by_content = _todo_id_by_unique_content(todos or [])
     for index, item in enumerate(value, start=1):
         if not isinstance(item, Mapping):
             continue
         status = str(item.get("status") or "pending")
-        if status == "blocked":
-            status = "failed"
-        if status not in {"pending", "in_progress", "completed", "skipped", "failed"}:
+        if status not in {"pending", "in_progress", "completed", "skipped", "failed", "blocked"}:
             status = "pending"
         content = str(item.get("content") or "")
         entries.append(
@@ -1133,6 +1174,69 @@ def _execution_log(
             )
         )
     return entries
+
+
+def _todo_id_from_event(event: Mapping[str, object], todos: list[TodoItem]) -> str | None:
+    index_value = event.get("todo_index") or event.get("todoIndex")
+    try:
+        todo_index = int(index_value) if index_value is not None else None
+    except (TypeError, ValueError):
+        todo_index = None
+    if todo_index is not None and 0 < todo_index <= len(todos):
+        return todos[todo_index - 1].id
+
+    content = event.get("todo_content") or event.get("todoContent")
+    if content is not None:
+        return _todo_id_by_unique_content(todos).get(str(content))
+    return None
+
+
+def _todo_id_by_unique_content(todos: list[TodoItem]) -> dict[str, str]:
+    todo_ids_by_content: dict[str, list[str]] = {}
+    for todo in todos:
+        if todo.id is None:
+            continue
+        todo_ids_by_content.setdefault(todo.content, []).append(todo.id)
+    return {content: todo_ids[0] for content, todo_ids in todo_ids_by_content.items() if len(todo_ids) == 1}
+
+
+def _link_execution_logs_to_tool_calls(
+    entries: list[ExecutionLogEntry],
+    tool_calls: list[ToolCallRecord],
+) -> list[ExecutionLogEntry]:
+    tool_call_ids_by_todo: dict[str, list[str]] = {}
+    for tool_call in tool_calls:
+        if tool_call.todo_id is None:
+            continue
+        tool_call_ids = tool_call_ids_by_todo.setdefault(tool_call.todo_id, [])
+        if tool_call.id not in tool_call_ids:
+            tool_call_ids.append(tool_call.id)
+
+    linked_entries: list[ExecutionLogEntry] = []
+    for entry in entries:
+        if entry.todo_id is None or entry.tool_call_ids:
+            linked_entries.append(entry)
+            continue
+        tool_call_ids = tool_call_ids_by_todo.get(entry.todo_id)
+        if not tool_call_ids:
+            linked_entries.append(entry)
+            continue
+        linked_entries.append(
+            ExecutionLogEntry(
+                id=entry.id,
+                todoId=entry.todo_id,
+                content=entry.content,
+                status=entry.status,
+                result=entry.result,
+                error=entry.error,
+                startedAt=entry.started_at,
+                completedAt=entry.completed_at,
+                toolCallIds=tool_call_ids,
+                artifactIds=entry.artifact_ids,
+                verificationIds=entry.verification_ids,
+            )
+        )
+    return linked_entries
 
 
 def _result_status(value: object, *, default: str = "completed") -> str:
@@ -1246,7 +1350,11 @@ def _is_agent_tool_lifecycle_event(kind: str) -> bool:
     return kind in {"agent.tool.started", "agent.tool.completed", "agent.tool.failed"}
 
 
-def _tool_calls_from_lifecycle_event(event: Mapping[str, object]) -> list[dict[str, object]]:
+def _tool_calls_from_lifecycle_event(
+    event: Mapping[str, object],
+    *,
+    todo_id: str | None = None,
+) -> list[dict[str, object]]:
     tool_name = str(event.get("tool_name") or "")
     tool_call_id = str(event.get("tool_call_id") or "")
     if not tool_name and not tool_call_id:
@@ -1257,6 +1365,8 @@ def _tool_calls_from_lifecycle_event(event: Mapping[str, object]) -> list[dict[s
         "name": tool_name,
         "status": _tool_lifecycle_status(kind),
     }
+    if todo_id is not None:
+        record["todoId"] = todo_id
     duration_ms = event.get("duration_ms") or event.get("durationMs")
     if duration_ms is not None:
         record["durationMs"] = duration_ms
