@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from threading import RLock
 from typing import Any
 
-from deepagents import create_deep_agent
+from deepagents import FilesystemPermission, create_deep_agent
 from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
 from deepagents.profiles.harness import HarnessProfile, register_harness_profile
@@ -27,10 +27,11 @@ from fsagent.runtime.agent_observability import (
     emit_agent_event,
 )
 from fsagent.runtime.approval import build_plan_review_payload, normalize_review_command
+from fsagent.runtime.context import build_context_bundle, format_context_for_planner
 from fsagent.runtime.executor import execute_plan
 from fsagent.runtime.fast import create_fast_agent, run_fast
 from fsagent.runtime.formatter import format_final_report
-from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path
+from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path, summarize_mcp_servers_for_review
 from fsagent.runtime.planner import generate_plan
 from fsagent.runtime.planner_agent import create_planner_agent
 from fsagent.runtime.planner_capabilities import PlannerCapabilitySummaryBuilder
@@ -39,8 +40,9 @@ from fsagent.runtime.prompts import (
     EXECUTOR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
+from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
 from fsagent.runtime.state import RuntimeState
-from fsagent.runtime.verifier import verify_execution
+from fsagent.runtime.verifier import verify_execution_async
 
 ProgressCallback = Callable[[Mapping[str, object]], Awaitable[None]]
 _HARNESS_PROFILE_LOCK = RLock()
@@ -87,6 +89,7 @@ def create_runtime(  # noqa: C901, PLR0915
     no_mcp: bool = False,
     trust_project_mcp: bool | None = None,
     tool_policy_profile: str = "dev-default",
+    permissions: list[FilesystemPermission] | None = None,
 ) -> CompiledStateGraph:
     """Create the explicit fast/plan runtime graph.
 
@@ -104,6 +107,7 @@ def create_runtime(  # noqa: C901, PLR0915
         no_mcp: Disable MCP loading.
         trust_project_mcp: Whether project-level stdio MCP servers are trusted.
         tool_policy_profile: fsagent tool policy profile.
+        permissions: Deep Agents filesystem permissions for plan-mode executor.
 
     Returns:
         Compiled runtime graph.
@@ -130,6 +134,30 @@ def create_runtime(  # noqa: C901, PLR0915
             trust_project_mcp=trust_project_mcp,
         )
         return [*(tools or []), *mcp.tools]
+
+    def mcp_review_gate(state: RuntimeState, *, next_node: str) -> Command[Any]:
+        servers = summarize_mcp_servers_for_review(
+            resolved_mcp_config_path,
+            no_mcp=no_mcp,
+            trust_project_mcp=trust_project_mcp,
+        )
+        has_high_risk_server = any(server.get("risk") == "high" for server in servers)
+        if not has_high_risk_server or state.get("mcp_review_approved") is True:
+            return Command(goto=next_node)
+
+        command = _normalize_gate_command(interrupt(build_mcp_review_payload(servers=servers)))
+        action = command.get("action")
+        if action == "approve":
+            return Command(update={"mcp_review_approved": True}, goto=next_node)
+        if action == "deny":
+            return Command(update={"mcp_review_approved": False, "status": "needs_revision"}, goto=END)
+        return Command(update={"mcp_review_approved": False, "status": "cancelled"}, goto=END)
+
+    def fast_mcp_review_gate(state: RuntimeState) -> Command[Any]:
+        return mcp_review_gate(state, next_node="fast_runner")
+
+    def plan_mcp_review_gate(state: RuntimeState) -> Command[Any]:
+        return mcp_review_gate(state, next_node="executor")
 
     async def fast_runner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         on_event = _progress_callback(config)
@@ -169,6 +197,10 @@ def create_runtime(  # noqa: C901, PLR0915
     async def planner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         await _emit_planner_capability_warnings(config, planner_capability_summary.warnings)
         await _emit_progress(config, {"kind": "planner.started", "message": "开始生成计划"})
+        original_user_content = _last_user_content(state)
+        context_bundle = build_context_bundle(user_message=original_user_content)
+        await _emit_planner_context_warnings(config, context_bundle.warnings)
+        planner_content = format_context_for_planner(context_bundle)
         on_event = _progress_callback(config)
         planner_context = AgentLogContext(agent_mode="plan", phase="planner")
         agent = create_planner_agent(
@@ -186,7 +218,7 @@ def create_runtime(  # noqa: C901, PLR0915
         )
         generated = await generate_plan(
             agent=agent,
-            content=_last_user_content(state),
+            content=planner_content,
             feedback=state.get("plan_feedback"),
             config=config,
         )
@@ -213,7 +245,7 @@ def create_runtime(  # noqa: C901, PLR0915
         command = normalize_review_command(interrupt(payload))
         action = command["action"]
         if action == "approve":
-            return Command(goto="executor")
+            return Command(goto="plan_mcp_review")
         if action == "edit":
             return Command(
                 update={
@@ -265,6 +297,7 @@ def create_runtime(  # noqa: C901, PLR0915
                 interrupt_on=policy_interrupt_on or None,
                 checkpointer=checkpointer,
                 store=store,
+                permissions=permissions,
             )
         await emit_agent_event(
             on_event,
@@ -295,10 +328,28 @@ def create_runtime(  # noqa: C901, PLR0915
             "final_response": result.final_result,
         }
 
-    def verifier(state: RuntimeState) -> dict[str, Any]:
-        result = verify_execution(
+    def deviation_review_gate(state: RuntimeState) -> Command[Any]:
+        if not state.get("deviation_requested"):
+            return Command(goto="verifier")
+
+        reason = state.get("deviation_reason") or "Executor requested a deviation from the approved plan."
+        payload = build_deviation_review_payload(
+            subject="Executor requested plan deviation",
+            proposed_input_summary=reason,
+        )
+        command = _normalize_gate_command(interrupt(payload))
+        action = command.get("action")
+        if action == "approve":
+            return Command(update={"deviation_requested": False}, goto="verifier")
+        if action == "replan":
+            return Command(update={"status": "needs_revision"}, goto=END)
+        return Command(update={"status": "cancelled"}, goto=END)
+
+    async def verifier(state: RuntimeState) -> dict[str, Any]:
+        result = await verify_execution_async(
             todos=state["todos"],
             execution_log=state.get("execution_log", []),
+            plan_meta=state.get("plan_meta"),
             verification=state.get("verification"),
         )
         return {"verification": result.verification, "status": result.status}
@@ -315,16 +366,19 @@ def create_runtime(  # noqa: C901, PLR0915
         return {"final_response": report}
 
     graph = StateGraph(RuntimeState)
+    graph.add_node("fast_mcp_review", fast_mcp_review_gate)
     graph.add_node("fast_runner", fast_runner)
     graph.add_node("planner", planner)
     graph.add_node("plan_review", plan_review)
+    graph.add_node("plan_mcp_review", plan_mcp_review_gate)
     graph.add_node("executor", executor)
+    graph.add_node("deviation_review_gate", deviation_review_gate)
     graph.add_node("verifier", verifier)
     graph.add_node("formatter", formatter)
-    graph.add_conditional_edges(START, _route_mode, {"fast": "fast_runner", "plan": "planner"})
+    graph.add_conditional_edges(START, _route_mode, {"fast": "fast_mcp_review", "plan": "planner"})
     graph.add_edge("fast_runner", END)
     graph.add_edge("planner", "plan_review")
-    graph.add_edge("executor", "verifier")
+    graph.add_edge("executor", "deviation_review_gate")
     graph.add_edge("verifier", "formatter")
     graph.add_edge("formatter", END)
     return graph.compile(checkpointer=checkpointer, store=store)
@@ -336,6 +390,12 @@ def _route_mode(state: RuntimeState) -> str:
         msg = "Runtime state mode must be `fast` or `plan`."
         raise ValueError(msg)
     return mode
+
+
+def _normalize_gate_command(payload: object) -> Mapping[str, Any]:
+    if isinstance(payload, Mapping):
+        return payload
+    return {"action": "cancel"}
 
 
 def _last_user_content(state: RuntimeState) -> str:
@@ -439,6 +499,18 @@ async def _emit_planner_capability_warnings(config: RunnableConfig | None, warni
             config,
             {
                 "kind": "planner.capability_warning",
+                "message": warning,
+                "warning": warning,
+            },
+        )
+
+
+async def _emit_planner_context_warnings(config: RunnableConfig | None, warnings: Sequence[str]) -> None:
+    for warning in warnings:
+        await _emit_progress(
+            config,
+            {
+                "kind": "planner.context_warning",
                 "message": warning,
                 "warning": warning,
             },
