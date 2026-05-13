@@ -14,7 +14,11 @@ def build_deviation_review_payload(
     return {
         "kind": "deviation_review",
         "risk": risk,
-        "subject": subject,
+        "subject": {
+            "source": "executor",
+            "summary": subject,
+            "reason": proposed_input_summary,
+        },
         "proposed_input_summary": proposed_input_summary,
         "allowed_actions": ["approve", "replan", "cancel"],
         "instructions": "Review the requested deviation. Approve to continue, replan to revise the plan, or cancel.",
@@ -27,7 +31,9 @@ def build_mcp_review_payload(*, servers: Sequence[Mapping[str, Any]]) -> dict[st
     return {
         "kind": "mcp_review",
         "risk": risk,
-        "subject": "High risk MCP servers require approval",
+        "subject": {
+            "servers": [dict(server) for server in servers],
+        },
         "proposed_input_summary": _summarize_servers(servers),
         "allowed_actions": ["approve", "deny", "cancel"],
         "instructions": "Review the MCP servers before enabling them for execution.",
