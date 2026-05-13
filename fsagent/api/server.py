@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -38,12 +39,24 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 SESSION_STORE_PATH_ENV = "FSAGENT_SESSION_STORE_PATH"
+CHECKPOINTER_PATH_ENV = "FSAGENT_CHECKPOINTER_PATH"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointerConfig:
+    """Startup configuration for a future persistent checkpointer."""
+
+    path: str
 
 
 def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C901, PLR0915
     """Create the HTTP API app."""
     configure_logging()
-    resolved_service = service or FsAgentApiService(session_store=_session_store_from_env())
+    checkpointer_config = _checkpointer_from_env()
+    resolved_service = service or FsAgentApiService(
+        session_store=_session_store_from_env(),
+        checkpoint_ref=checkpointer_config.path if checkpointer_config is not None else None,
+    )
     app = FastAPI(title="fsagent API")
     app.middleware("http")(_log_http_request)
 
@@ -148,6 +161,15 @@ def _session_store_from_env(env: dict[str, str] | None = None) -> SessionStore:
     if path:
         return JsonlSessionStore(path)
     return InMemorySessionStore()
+
+
+def _checkpointer_from_env(env: dict[str, str] | None = None) -> CheckpointerConfig | None:
+    """Read persistent checkpointer startup configuration."""
+    values = os.environ if env is None else env
+    path = values.get(CHECKPOINTER_PATH_ENV, "").strip()
+    if not path:
+        return None
+    return CheckpointerConfig(path=path)
 
 
 async def _log_http_request(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
