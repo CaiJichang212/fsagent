@@ -198,7 +198,10 @@ def create_runtime(  # noqa: C901, PLR0915
         await _emit_planner_capability_warnings(config, planner_capability_summary.warnings)
         await _emit_progress(config, {"kind": "planner.started", "message": "开始生成计划"})
         original_user_content = _last_user_content(state)
-        context_bundle = build_context_bundle(user_message=original_user_content)
+        context_bundle = build_context_bundle(
+            user_message=original_user_content,
+            repo_rules=_planner_repo_rules(system_prompt),
+        )
         await _emit_planner_context_warnings(config, context_bundle.warnings)
         planner_content = format_context_for_planner(context_bundle)
         on_event = _progress_callback(config)
@@ -326,6 +329,8 @@ def create_runtime(  # noqa: C901, PLR0915
             "execution_log": result.execution_log,
             "evidence": result.evidence,
             "final_response": result.final_result,
+            "deviation_requested": result.deviation_requested,
+            "deviation_reason": result.deviation_reason,
         }
 
     def deviation_review_gate(state: RuntimeState) -> Command[Any]:
@@ -460,6 +465,63 @@ def _system_prompt_text(system_prompt: str | SystemMessage | None) -> str | None
     if isinstance(system_prompt, SystemMessage):
         return str(system_prompt.content)
     return system_prompt
+
+
+def _planner_repo_rules(system_prompt: str | SystemMessage | None) -> str | None:
+    """Extract repo rules from system prompt for trusted context injection.
+
+    If the system prompt looks like AGENTS.md format (contains multiple ## sections),
+    extract only the rules sections. Otherwise, return the entire text as rules.
+    """
+    text = _system_prompt_text(system_prompt)
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Check if this looks like AGENTS.md format with multiple ## sections
+    # If it has a main title (# ) followed by multiple ## sections, extract only rules
+    lines = text.split("\n")
+    has_main_title = any(line.startswith("# ") for line in lines)
+    section_count = sum(1 for line in lines if line.startswith("## "))
+
+    if has_main_title and section_count > 1:
+        # AGENTS.md format - extract only rules sections
+        # Exclude sections that are clearly not rules (like project background)
+        result_lines = []
+        in_rules_section = False
+
+        # Sections that are NOT rules (project background, overview, etc.)
+        non_rules_keywords = [
+            "项目定位",
+            "project positioning",
+            "背景",
+            "background",
+            "简介",
+            "introduction",
+            "概述",
+            "overview",
+        ]
+
+        for line in lines:
+            if line.startswith("## "):
+                # Check if this is a rules section
+                section_title = line[3:].lower()
+
+                # Exclude if it's explicitly a non-rules section
+                in_rules_section = not any(keyword in section_title for keyword in non_rules_keywords)
+
+                # Skip the section header itself
+                continue
+
+            if in_rules_section:
+                result_lines.append(line)
+
+        rules_text = "\n".join(result_lines).strip()
+        return rules_text or None
+
+    # Pure rules text - return as-is
+    return text
 
 
 def _join_prompts(system_prompt: str | SystemMessage | None, runtime_prompt: str) -> str | SystemMessage:
