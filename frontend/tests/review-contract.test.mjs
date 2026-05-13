@@ -9,6 +9,7 @@ const typesSource = readFileSync(resolve(__dirname, "../src/app/components/types
 const clientSource = readFileSync(resolve(__dirname, "../src/app/api/fsagent-client.ts"), "utf8");
 const appSource = readFileSync(resolve(__dirname, "../src/app/App.tsx"), "utf8");
 const gateSource = readFileSync(resolve(__dirname, "../src/app/components/review-gate.tsx"), "utf8");
+const planReviewSource = readFileSync(resolve(__dirname, "../src/app/components/plan-review-panel.tsx"), "utf8");
 
 test("frontend models generic review snapshots from the API", () => {
   assert.match(typesSource, /export type ReviewKind =/);
@@ -38,4 +39,10 @@ test("tool review gate supports per-action batch decisions", () => {
   assert.match(gateSource, /type:\s*"edit"/);
   assert.match(gateSource, /decision\.type === "reject"/);
   assert.match(gateSource, /decision\.type === "respond"/);
+});
+
+test("plan review edits preserve verification suggestions", () => {
+  assert.match(typesSource, /verification\?: string\[\]/);
+  assert.match(planReviewSource, /verification:\s*\[\.\.\.\(planMeta\.verification \?\? \[\]\)\]/);
+  assert.match(planReviewSource, /verification:\s*\(draftMeta\.verification \?\? \[\]\)/);
 });
