@@ -310,7 +310,7 @@ class FsAgentApiService:
             updatedAt=_now(),
         )
         saver = InMemorySaver()
-        runtime = self._make_runtime(request, saver)
+        runtime = self._make_runtime(request, saver, assembly)
         run_logger = RunLogger(
             logger=logger,
             context=RunLogContext(
@@ -341,13 +341,32 @@ class FsAgentApiService:
             user_message_length=len(request.message),
         )
         self._append_event(record, "run.started", f"runtime 启动 · model={model}")
+        for warning in assembly.warnings:
+            self._append_event(
+                record,
+                "runtime.profile_warning",
+                warning,
+                profile=assembly.profile,
+                backend_profile=assembly.backend_profile,
+                permission_profile=assembly.permission_profile,
+                tool_policy_profile=assembly.tool_policy_profile,
+            )
         return record
 
-    def _make_runtime(self, request: RunRequest, checkpointer: InMemorySaver) -> RuntimeLike:
+    def _make_runtime(
+        self,
+        request: RunRequest,
+        checkpointer: InMemorySaver,
+        assembly: RuntimeAssemblyConfig,
+    ) -> RuntimeLike:
         parameters = inspect.signature(self._runtime_factory).parameters
-        if len(parameters) == 1:
+        request_only_parameter_count = 1
+        request_checkpointer_parameter_count = 2
+        if len(parameters) == request_only_parameter_count:
             return self._runtime_factory(request)
-        return self._runtime_factory(request, checkpointer)
+        if len(parameters) == request_checkpointer_parameter_count:
+            return self._runtime_factory(request, checkpointer)
+        return self._runtime_factory(request, checkpointer, assembly)
 
     def _apply_runtime_result(
         self,
@@ -547,11 +566,14 @@ class FsAgentApiService:
         }
 
     @staticmethod
-    def _default_runtime_factory(request: RunRequest, checkpointer: InMemorySaver) -> RuntimeLike:
+    def _default_runtime_factory(
+        request: RunRequest,
+        checkpointer: InMemorySaver,
+        assembly: RuntimeAssemblyConfig,
+    ) -> RuntimeLike:
         env = FsAgentEnv.from_sources()
         if request.model:
             env = _env_for_model(env, request.model)
-        assembly = _runtime_assembly_for_request(request)
         return create_runtime(
             model=build_chat_qwen(env, thinking=request.thinking),
             checkpointer=checkpointer,
@@ -785,7 +807,7 @@ def _hitl_action_summary(action_request: Mapping[str, object]) -> str:
 
 def _review_subject(kind: str, interrupt: Mapping[str, object], record: SessionRecord) -> dict[str, object]:
     action_requests = _hitl_action_requests(interrupt)
-    if action_requests:
+    if kind == "tool_review" and action_requests:
         return {
             "actionRequests": action_requests,
             "reviewConfigs": _hitl_review_configs(interrupt),
