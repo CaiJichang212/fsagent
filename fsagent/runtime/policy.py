@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 
+from fsagent.runtime.risk import is_high_risk_tool_text
 from fsagent.runtime.state import RuntimeState
 from fsagent.runtime.tools import ToolMetadata, tool_metadata
 
@@ -139,8 +140,7 @@ def _dev_default_decision(  # noqa: PLR0911
     if tool_name in _READ_TOOLS:
         return _decision(tool_name, "low", "allow", "Read-only filesystem tool.", profile)
     if tool_name in _WRITE_TOOLS:
-        action = "allow" if phase == "executor" else "review"
-        return _decision(tool_name, "medium", action, "Write tool is allowed only in approved execution.", profile)
+        return _decision(tool_name, "high", "review", "Write tools require tool review.", profile)
     if tool_name in _EXECUTE_TOOLS:
         return _decision(tool_name, "high", "review", "Local execution requires tool review.", profile)
     if tool_name in _TASK_TOOLS:
@@ -167,11 +167,19 @@ def _locked_down_decision(
             profile,
         )
     if source == "mcp":
+        if metadata_risk in {"high", "critical"}:
+            return _decision(
+                tool_name,
+                metadata_risk,
+                "review",
+                "MCP tool metadata marks this call as high risk.",
+                profile,
+            )
         return _decision(
             tool_name,
-            metadata_risk or "high",
-            "review",
-            "MCP tools require review in locked-down policy.",
+            metadata_risk or "low",
+            "allow",
+            "Read-only MCP tool allowed by locked-down policy.",
             profile,
         )
     if tool_name in _WRITE_TOOLS | _EXECUTE_TOOLS | _TASK_TOOLS:
@@ -228,6 +236,11 @@ def _policy_event(decision: ToolPolicyDecision, args: object, tool_call_id: str)
             }
         ],
     }
+
+
+def high_risk_tool_name_or_description(name: object, description: object = None) -> bool:
+    """Return whether tool display text suggests high-risk side effects."""
+    return is_high_risk_tool_text(name, description)
 
 
 def _strengthened_review_config(current: object) -> bool | dict[str, object]:
