@@ -1,12 +1,12 @@
 # fsagent
 
-`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供 FastAPI 服务与 React 前端，在同一套 LangGraph runtime 上支持快速问答和可审核的计划执行流程。
+`fsagent` 是 Deep Agents 的 Fast/Plan 双模式运行时扩展，提供 FastAPI 服务与 React 前端，支持快速问答和可审核的计划执行流程。
 
 ## 核心能力
 
-- `fast` 模式：直接执行单次任务，适合快速问答、仓库检查等一次性请求。
+- `fast` 模式：直接执行单次任务，适合快速问答、单轮工具调用回答等。
 - `plan` 模式：先生成 todo 计划，等待用户审核后再执行，并产出最终报告。
-- 通用 review 模型：plan、tool、deviation、MCP 共用 `pendingReview` / `reviews` 数据结构。
+- 通用 review 模型：plan、tool、deviation[Agent 在执行计划的过程中，发现原计划不合适或需要调整，主动"举手"请求人工介入审核的机制]、MCP 共用 `pendingReview` / `reviews` 数据结构。
 - 会话快照：支持内存 store 和 JSONL store；服务重启后可恢复 API snapshot。
 - 工具策略：内置 `dev-default`、`locked-down`、`ci-eval` 三套 profile。
 - 验证记录：Plan 执行可附带验证命令，结果写入 `verification` 并进入最终报告。
@@ -249,7 +249,7 @@ Review 类型包括：
 - `plan_review`：审核或修改计划。
 - `tool_review`：高风险工具调用审批。
 - `deviation_review`：执行阶段需要偏离已批准计划时触发。
-- `mcp_review`：启用或调用 MCP server 时的审核。
+- `mcp_review`：兼容旧 review contract；当前默认不在启用 MCP server 时触发批量审批。
 
 `edit` 计划时会保留原始 `planMeta.verification` 建议字段。
 
@@ -284,16 +284,16 @@ Review 类型包括：
 | 工具类型   | 示例                              | 默认行为             |
 | ---------- | --------------------------------- | -------------------- |
 | 只读工具   | `ls`、`glob`、`grep`、`read_file` | 允许                 |
-| 写入工具   | `write_file`、`edit_file`         | 仅 executor 阶段允许 |
+| 写入工具   | `write_file`、`edit_file`         | 进入 review          |
 | 执行工具   | `execute`、`bash`、`shell`        | 进入 review          |
 | 子任务工具 | `task`                            | 仅 executor 阶段允许 |
 | 未知工具   | -                                 | 默认拒绝             |
 
 补充说明：
 
-- `locked-down` 只直接放行只读工具，其余大多要求 review 或被拒绝。
+- `locked-down` 直接放行只读工具和低风险 MCP 工具；高风险工具要求 review，未知工具仍会被拒绝。
 - `ci-eval` 只允许确定性的只读工具，拒绝有副作用工具。
-- MCP 工具在启用后仍会按 metadata 风险和 profile 继续判定。
+- MCP 工具不会在 server 启用阶段批量审批；只有实际调用高风险 MCP 工具时才进入 `tool_review`。
 
 ## 持久化与恢复
 
@@ -350,6 +350,7 @@ MCP 默认关闭。启用时至少需要：
 
 - `mcp.json` 默认被 `.gitignore` 忽略，可能包含本地命令、私有 server 或密钥。
 - 未确认配置可信前，不要开启项目级 stdio MCP server。
+- 当前不会在加载 MCP server 时弹出批量 `mcp_review`；只读 MCP 工具可直接调用，高风险 MCP 工具调用会进入 `tool_review`。
 
 ## 日志
 
