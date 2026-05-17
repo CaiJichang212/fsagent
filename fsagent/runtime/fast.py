@@ -11,7 +11,7 @@ from langchain.agents.middleware.types import (
     ModelResponse,
 )
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.store.base import BaseStore
@@ -25,6 +25,11 @@ from fsagent.runtime.agent_observability import (
 )
 from fsagent.runtime.prompts import FAST_SYSTEM_PROMPT
 from fsagent.runtime.state import RuntimeState
+
+_FAST_TOOL_LIMIT_FALLBACK = (
+    "Fast 模式已使用过一次工具调用, 后续工具调用已被忽略。"
+    "请切换 Plan 模式或重新发起任务以检查更多工具。"
+)
 
 
 class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
@@ -59,6 +64,8 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
         limited_request = self._disable_tools_if_used(request)
         self._emit_tools_disabled_if_needed(request, len(request.tools))
         response = handler(limited_request)
+        if request.state.get("fast_tool_round_used", False):
+            return self._without_post_round_tool_calls(response)
         if self._response_has_tool_calls(response) and not request.state.get("fast_tool_round_used", False):
             return ExtendedModelResponse(
                 model_response=response,
@@ -75,6 +82,8 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
         limited_request = self._disable_tools_if_used(request)
         await self._emit_tools_disabled_if_needed_async(request, len(request.tools))
         response = await handler(limited_request)
+        if request.state.get("fast_tool_round_used", False):
+            return self._without_post_round_tool_calls(response)
         if self._response_has_tool_calls(response) and not request.state.get("fast_tool_round_used", False):
             return ExtendedModelResponse(
                 model_response=response,
@@ -91,6 +100,19 @@ class FastToolRoundMiddleware(AgentMiddleware[RuntimeState, Any, Any]):
     @staticmethod
     def _response_has_tool_calls(response: ModelResponse[Any]) -> bool:
         return any(isinstance(message, AIMessage) and message.tool_calls for message in response.result)
+
+    @classmethod
+    def _without_post_round_tool_calls(cls, response: ModelResponse[Any]) -> ModelResponse[Any]:
+        if not cls._response_has_tool_calls(response):
+            return response
+        return ModelResponse(result=[cls._message_without_tool_calls(message) for message in response.result])
+
+    @staticmethod
+    def _message_without_tool_calls(message: BaseMessage) -> BaseMessage:
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            return message
+        content = message.content or _FAST_TOOL_LIMIT_FALLBACK
+        return AIMessage(content=content)
 
     def _emit_tools_disabled_if_needed(self, request: ModelRequest[Any], available_tool_count: int) -> None:
         if request.state.get("fast_tool_round_used", False) and available_tool_count > 0:
