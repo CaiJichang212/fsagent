@@ -111,13 +111,18 @@ export default function App() {
     );
   };
 
-  const markPending = (id: string, status: FsAgentSession["status"]) => {
+  const markPending = (
+    id: string,
+    status: FsAgentSession["status"],
+    pendingReview?: ReviewRecord | null,
+  ) => {
     setSessions((arr) =>
       arr.map((s) =>
         s.sessionId === id
           ? {
               ...s,
               status,
+              ...(pendingReview !== undefined ? { pendingReview } : {}),
               updatedAt: new Date().toISOString(),
             }
           : s,
@@ -144,12 +149,12 @@ export default function App() {
     payload: ReviewDecisionPayload,
     pendingStatus: FsAgentSession["status"],
   ) => {
-    markPending(id, pendingStatus);
+    markPending(id, pendingStatus, null);
     try {
       await streamDecideReview(id, review.id, payload, replaceSession);
     } catch (error) {
       toast.error(toErrorMessage(error));
-      markPending(id, review.kind === "plan_review" ? "awaiting_plan_review" : "awaiting_tool_review");
+      markPending(id, review.kind === "plan_review" ? "awaiting_plan_review" : "awaiting_tool_review", review);
     }
   };
 
@@ -313,6 +318,17 @@ function SessionView({
   session: FsAgentSession;
   onReviewDecision: (review: ReviewRecord, payload: ReviewDecisionPayload, pendingStatus: FsAgentSession["status"]) => void;
 }) {
+  const showExecution =
+    session.mode === "plan" &&
+    session.todos.length > 0 &&
+    (session.executionLog.length > 0 ||
+      session.status === "executing" ||
+      session.status === "awaiting_tool_review" ||
+      session.status === "verifying" ||
+      session.status === "needs_revision" ||
+      session.status === "completed" ||
+      session.status === "failed");
+
   return (
     <div className="max-w-4xl mx-auto space-y-5">
       <div className="rounded-xl border border-border bg-card px-5 py-4">
@@ -336,7 +352,7 @@ function SessionView({
         />
       )}
 
-      {session.mode === "plan" && session.executionLog.length > 0 && (
+      {showExecution && (
         <ExecutionView todos={session.todos} log={session.executionLog} />
       )}
 
