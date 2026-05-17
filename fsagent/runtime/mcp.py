@@ -15,6 +15,8 @@ from typing import Any
 from anyio import Path as AsyncPath
 from langchain_core.tools import BaseTool, StructuredTool
 
+from fsagent.runtime.risk import is_high_risk_tool_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -157,7 +159,7 @@ async def load_runtime_mcp_tools(
             await AsyncPath(prepared.temporary_path).unlink(missing_ok=True)
 
     return RuntimeMCPResult(
-        tools=_make_mcp_tool_errors_nonfatal(tools, trust_project_mcp=trust_project_mcp),
+        tools=_make_mcp_tool_errors_nonfatal(tools),
         client=manager,
         server_infos=list(server_infos),
     )
@@ -205,35 +207,72 @@ async def _resolve_and_load_mcp_tools(
 
 
 def _import_deepagents_cli_mcp_tools() -> ModuleType:
-    try:
-        return importlib.import_module("deepagents_cli.mcp_tools")
-    except ModuleNotFoundError as exc:
-        if exc.name != "deepagents_cli":
-            raise
+    cli_result = _try_import_mcp_module("deepagents_cli.mcp_tools")
+    if isinstance(cli_result, ModuleType):
+        return cli_result
 
-        source_path = _deepagents_cli_source_path()
-        if source_path is not None:
-            if source_path not in sys.path:
-                sys.path.insert(0, source_path)
-            try:
-                return importlib.import_module("deepagents_cli.mcp_tools")
-            except ModuleNotFoundError as retry_exc:
-                if retry_exc.name != "deepagents_cli":
-                    raise
-
-        msg = (
-            "MCP 已启用, 但当前 Python 环境找不到 `deepagents-cli`. "
-            "请使用 `./scripts/start-dev.sh` 或 `uv run uvicorn fsagent.api.server:app "
-            "--host 127.0.0.1 --port 8000 --reload --no-access-log` 启动后端, "
-            "或先执行 `uv sync` 安装后端依赖."
+    if cli_result.name == "deepagents_cli":
+        cli_source_result = _try_import_mcp_module_from_source(
+            "deepagents_cli.mcp_tools",
+            _deepagents_cli_source_path(),
         )
-        raise RuntimeError(msg) from exc
+        if isinstance(cli_source_result, ModuleType):
+            return cli_source_result
+
+    code_result = _try_import_mcp_module("deepagents_code.mcp_tools")
+    if isinstance(code_result, ModuleType):
+        return code_result
+
+    code_source_result = _try_import_mcp_module_from_source(
+        "deepagents_code.mcp_tools",
+        _deepagents_code_source_path(),
+    )
+    if isinstance(code_source_result, ModuleType):
+        return code_source_result
+
+    msg = (
+        "MCP 已启用, 但当前 Python 环境找不到 MCP 工具加载模块. "
+        "请使用 `./scripts/start-dev.sh` 或 `uv run uvicorn fsagent.api.server:app "
+        "--host 127.0.0.1 --port 8000 --reload --no-access-log` 启动后端, "
+        "或先执行 `uv sync` 安装后端依赖."
+    )
+    raise RuntimeError(msg) from cli_result
+
+
+def _try_import_mcp_module(module_name: str) -> ModuleType | ModuleNotFoundError:
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if not _missing_import_target(module_name, exc):
+            raise
+        return exc
+
+
+def _try_import_mcp_module_from_source(module_name: str, source_path: str | None) -> ModuleType | ModuleNotFoundError:
+    if source_path is None:
+        return ModuleNotFoundError(name=module_name)
+    if source_path not in sys.path:
+        sys.path.insert(0, source_path)
+    return _try_import_mcp_module(module_name)
+
+
+def _missing_import_target(module_name: str, exc: ModuleNotFoundError) -> bool:
+    root_name = module_name.split(".", maxsplit=1)[0]
+    return exc.name in {root_name, module_name}
 
 
 def _deepagents_cli_source_path() -> str | None:
     project_root = Path(__file__).resolve().parents[2]
     candidate = project_root.parent.parent / "libs" / "cli"
     if (candidate / "deepagents_cli" / "mcp_tools.py").exists():
+        return str(candidate)
+    return None
+
+
+def _deepagents_code_source_path() -> str | None:
+    project_root = Path(__file__).resolve().parents[2]
+    candidate = project_root.parent.parent / "libs" / "code"
+    if (candidate / "deepagents_code" / "mcp_tools.py").exists():
         return str(candidate)
     return None
 
@@ -343,18 +382,18 @@ def _string_value(value: object) -> str | None:
     return normalized or None
 
 
-def _make_mcp_tool_errors_nonfatal(tools: list[BaseTool], *, trust_project_mcp: bool | None) -> list[BaseTool]:
-    return [_make_mcp_tool_error_nonfatal(tool, trust_project_mcp=trust_project_mcp) for tool in tools]
+def _make_mcp_tool_errors_nonfatal(tools: list[BaseTool]) -> list[BaseTool]:
+    return [_make_mcp_tool_error_nonfatal(tool) for tool in tools]
 
 
-def _make_mcp_tool_error_nonfatal(tool: BaseTool, *, trust_project_mcp: bool | None) -> BaseTool:
+def _make_mcp_tool_error_nonfatal(tool: BaseTool) -> BaseTool:
     async def invoke_mcp_tool(**kwargs: object) -> object:
         try:
             return await tool.ainvoke(kwargs)
         except Exception as exc:  # noqa: BLE001  # external MCP tool failures should be visible to the model
             return _format_mcp_tool_error(tool.name, exc)
 
-    metadata = _mcp_tool_metadata(tool, trust_project_mcp=trust_project_mcp)
+    metadata = _mcp_tool_metadata(tool)
     if tool.args_schema is None:
         tool.handle_tool_error = _make_mcp_tool_error_formatter(tool.name)
         tool.metadata = metadata
@@ -371,11 +410,15 @@ def _make_mcp_tool_error_nonfatal(tool: BaseTool, *, trust_project_mcp: bool | N
     )
 
 
-def _mcp_tool_metadata(tool: BaseTool, *, trust_project_mcp: bool | None) -> dict[str, object]:
+def _mcp_tool_metadata(tool: BaseTool) -> dict[str, object]:
     metadata = dict(tool.metadata or {})
     metadata.setdefault("fsagent_tool_source", "mcp")
-    metadata.setdefault("fsagent_tool_risk", "high" if trust_project_mcp else "medium")
+    metadata.setdefault("fsagent_tool_risk", _infer_mcp_tool_risk(tool))
     return metadata
+
+
+def _infer_mcp_tool_risk(tool: BaseTool) -> str:
+    return "high" if is_high_risk_tool_text(tool.name, tool.description) else "low"
 
 
 def _make_mcp_tool_error_formatter(tool: str) -> Callable[[Exception], str]:
