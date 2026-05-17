@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 DEFAULT_MODEL = "Qwen/Qwen3.5-27B"
 DEFAULT_BASE_URL = "https://api-inference.modelscope.cn/v1"
 DEFAULT_MODELS_JSON = "model_config.json"
-EMPTY_CHOICES_MAX_ATTEMPTS = 2
+EMPTY_CHOICES_MAX_ATTEMPTS = 3
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
