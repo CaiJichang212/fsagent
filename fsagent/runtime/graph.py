@@ -31,7 +31,7 @@ from fsagent.runtime.context import build_context_bundle, format_context_for_pla
 from fsagent.runtime.executor import execute_plan
 from fsagent.runtime.fast import create_fast_agent, run_fast
 from fsagent.runtime.formatter import format_final_report
-from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path, summarize_mcp_servers_for_review
+from fsagent.runtime.mcp import load_runtime_mcp_tools, resolve_mcp_config_path
 from fsagent.runtime.planner import generate_plan
 from fsagent.runtime.planner_agent import create_planner_agent
 from fsagent.runtime.planner_capabilities import PlannerCapabilitySummaryBuilder
@@ -40,7 +40,7 @@ from fsagent.runtime.prompts import (
     EXECUTOR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
-from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
+from fsagent.runtime.reviews import build_deviation_review_payload
 from fsagent.runtime.state import RuntimeState
 from fsagent.runtime.verifier import verify_execution_async
 
@@ -135,30 +135,6 @@ def create_runtime(  # noqa: C901, PLR0915
         )
         return [*(tools or []), *mcp.tools]
 
-    def mcp_review_gate(state: RuntimeState, *, next_node: str) -> Command[Any]:
-        servers = summarize_mcp_servers_for_review(
-            resolved_mcp_config_path,
-            no_mcp=no_mcp,
-            trust_project_mcp=trust_project_mcp,
-        )
-        has_high_risk_server = any(server.get("risk") == "high" for server in servers)
-        if not has_high_risk_server or state.get("mcp_review_approved") is True:
-            return Command(goto=next_node)
-
-        command = _normalize_gate_command(interrupt(build_mcp_review_payload(servers=servers)))
-        action = command.get("action")
-        if action == "approve":
-            return Command(update={"mcp_review_approved": True}, goto=next_node)
-        if action == "deny":
-            return Command(update={"mcp_review_approved": False, "status": "needs_revision"}, goto=END)
-        return Command(update={"mcp_review_approved": False, "status": "cancelled"}, goto=END)
-
-    def fast_mcp_review_gate(state: RuntimeState) -> Command[Any]:
-        return mcp_review_gate(state, next_node="fast_runner")
-
-    def plan_mcp_review_gate(state: RuntimeState) -> Command[Any]:
-        return mcp_review_gate(state, next_node="executor")
-
     async def fast_runner(state: RuntimeState, config: RunnableConfig | None = None) -> dict[str, Any]:
         on_event = _progress_callback(config)
         fast_tools = await combined_tools()
@@ -248,7 +224,7 @@ def create_runtime(  # noqa: C901, PLR0915
         command = normalize_review_command(interrupt(payload))
         action = command["action"]
         if action == "approve":
-            return Command(goto="plan_mcp_review")
+            return Command(goto="executor")
         if action == "edit":
             return Command(
                 update={
@@ -361,6 +337,7 @@ def create_runtime(  # noqa: C901, PLR0915
 
     def formatter(state: RuntimeState) -> dict[str, Any]:
         report = format_final_report(
+            status=str(state.get("status") or "completed"),
             result=state.get("final_response") or "Plan execution did not produce a final result.",
             todos=state["todos"],
             execution_log=state.get("execution_log", []),
@@ -371,16 +348,14 @@ def create_runtime(  # noqa: C901, PLR0915
         return {"final_response": report}
 
     graph = StateGraph(RuntimeState)
-    graph.add_node("fast_mcp_review", fast_mcp_review_gate)
     graph.add_node("fast_runner", fast_runner)
     graph.add_node("planner", planner)
     graph.add_node("plan_review", plan_review)
-    graph.add_node("plan_mcp_review", plan_mcp_review_gate)
     graph.add_node("executor", executor)
     graph.add_node("deviation_review_gate", deviation_review_gate)
     graph.add_node("verifier", verifier)
     graph.add_node("formatter", formatter)
-    graph.add_conditional_edges(START, _route_mode, {"fast": "fast_mcp_review", "plan": "planner"})
+    graph.add_conditional_edges(START, _route_mode, {"fast": "fast_runner", "plan": "planner"})
     graph.add_edge("fast_runner", END)
     graph.add_edge("planner", "plan_review")
     graph.add_edge("executor", "deviation_review_gate")
