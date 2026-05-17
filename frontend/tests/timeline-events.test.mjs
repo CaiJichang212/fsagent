@@ -13,3 +13,14 @@ test("planner capability warnings are represented in frontend timeline events", 
   assert.match(timelineSource, /"planner\.capability_warning":\s*<AlertTriangle/);
   assert.match(timelineSource, /"planner\.capability_warning":\s*"text-amber-500 bg-amber-500\/15"/);
 });
+
+test("timeline lifecycle events are collapsed into stateful visual items", () => {
+  assert.match(timelineSource, /function buildTimelineItems/);
+  assert.match(timelineSource, /LIFECYCLE_EVENTS/);
+  assert.match(timelineSource, /status:\s*"running"/);
+  assert.match(timelineSource, /status:\s*"completed"/);
+  assert.match(timelineSource, /status:\s*"failed"/);
+  assert.match(timelineSource, /return\s*"waiting"/);
+  assert.match(timelineSource, /animate-spin/);
+  assert.doesNotMatch(timelineSource, /events\.map\(\(e\)/);
+});
