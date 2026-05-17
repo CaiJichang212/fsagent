@@ -40,6 +40,7 @@ from fsagent.runtime.assembly import RuntimeAssemblyConfig, resolve_runtime_asse
 from fsagent.runtime.graph import create_runtime
 from fsagent.runtime.model_config import FsAgentEnv, build_chat_qwen, resolve_thinking_enabled
 from fsagent.runtime.policy import evaluate_tool_policy
+from fsagent.runtime.risk import is_high_risk_tool_text
 
 logger = get_logger(__name__)
 
@@ -789,10 +790,13 @@ def _hitl_allowed_actions(review_configs: list[dict[str, object]]) -> list[str]:
 
 
 def _hitl_risk(action_requests: list[dict[str, object]]) -> str:
-    names = {str(item.get("name") or "") for item in action_requests}
-    if names & {"execute", "bash", "shell"}:
+    if any(_hitl_action_risk(item) == "high" for item in action_requests):
         return "high"
     return "medium"
+
+
+def _hitl_action_risk(action_request: Mapping[str, object]) -> str:
+    return "high" if is_high_risk_tool_text(action_request.get("name"), action_request.get("description")) else "medium"
 
 
 def _hitl_action_summary(action_request: Mapping[str, object]) -> str:
@@ -850,7 +854,8 @@ def _hitl_policy_events(record: SessionRecord, review: ReviewRecord) -> list[dic
             continue
         tool_name = str(action_request.get("name") or "")
         decision = evaluate_tool_policy(tool_name, profile=profile, phase=phase)
-        if decision.action != "review":
+        risk = _hitl_action_risk(action_request)
+        if decision.action != "review" and risk != "high":
             continue
         tool_call_id = _hitl_tool_call_id(review, action_request, index)
         events.append(
@@ -860,15 +865,15 @@ def _hitl_policy_events(record: SessionRecord, review: ReviewRecord) -> list[dic
                 "tool_name": tool_name,
                 "tool_call_id": tool_call_id,
                 "review_id": review.id,
-                "risk": decision.risk,
+                "risk": risk,
                 "profile": decision.profile,
-                "policyDecision": decision.action,
-                "reason": decision.reason,
+                "policyDecision": "review",
+                "reason": decision.reason if decision.action == "review" else "Tool call requires review.",
                 "tool_calls": [
                     {
                         "id": tool_call_id,
                         "name": tool_name,
-                        "risk": decision.risk,
+                        "risk": risk,
                         "status": "review_required",
                         "inputSummary": _hitl_action_summary(action_request),
                         "reviewId": review.id,
