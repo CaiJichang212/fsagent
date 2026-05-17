@@ -6,6 +6,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphInterrupt
 
 from fsagent.runtime.state import EvidenceRecord, ExecutionLogEntry, PlanMeta, TodoItem
 
@@ -77,6 +78,7 @@ async def execute_plan(
             {
                 "kind": "todo.started",
                 "message": f"开始执行 {todo['content']}",
+                **_todo_event_fields(todo, index),
                 "todos": _todo_snapshot(updated),
                 "execution_log": _log_snapshot(execution_log),
             },
@@ -92,6 +94,8 @@ async def execute_plan(
                 },
                 config=_todo_execution_config(config, index),
             )
+        except GraphInterrupt:
+            raise
         except Exception as exc:  # noqa: BLE001  # per-item execution errors are logged and do not stop later items
             todo["status"] = "failed"
             msg = str(exc)
@@ -117,6 +121,7 @@ async def execute_plan(
                 {
                     "kind": "todo.failed",
                     "message": f"执行失败 {todo['content']}: {msg}",
+                    **_todo_event_fields(todo, index),
                     "todos": _todo_snapshot(updated),
                     "execution_log": _log_snapshot(execution_log),
                 },
@@ -166,6 +171,7 @@ async def execute_plan(
             {
                 "kind": "todo.completed",
                 "message": f"完成 {todo['content']}",
+                **_todo_event_fields(todo, index),
                 "todos": _todo_snapshot(updated),
                 "execution_log": _log_snapshot(execution_log),
             },
@@ -231,6 +237,14 @@ def _extract_result_text(result: Mapping[str, Any]) -> str:
         if isinstance(content, str) and content:
             return content
     return "Completed."
+
+
+def _todo_event_fields(todo: TodoItem, index: int) -> dict[str, object]:
+    return {
+        "todo_id": todo["id"],
+        "todo_index": index + 1,
+        "todo_content": todo["content"],
+    }
 
 
 async def _emit(on_event: ProgressCallback | None, event: ProgressEvent) -> None:
