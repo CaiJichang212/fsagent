@@ -251,6 +251,61 @@ async def test_build_chat_qwen_retries_transient_empty_choices_error(monkeypatch
     assert calls == 2
 
 
+@pytest.mark.asyncio
+async def test_build_chat_qwen_retries_two_consecutive_empty_choices_errors(monkeypatch):
+    calls = 0
+
+    class FakeChatQwen:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def _agenerate(self, *_args: object, **_kwargs: object) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                msg = "Received response with null value for 'choices'. Full response keys: ['id']"
+                raise TypeError(msg)
+            return {"ok": True}
+
+    module = types.ModuleType("langchain_qwq")
+    module.ChatQwen = FakeChatQwen
+    monkeypatch.setitem(sys.modules, "langchain_qwq", module)
+
+    model = build_chat_qwen(FsAgentEnv(available_models_json="missing.json"))
+
+    result = await model._agenerate([])  # noqa: SLF001
+
+    assert result == {"ok": True}
+    assert calls == 3
+
+
+def test_build_chat_qwen_retries_sync_empty_choices_error(monkeypatch):
+    calls = 0
+
+    class FakeChatQwen:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def _generate(self, *_args: object, **_kwargs: object) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                msg = "Received response with null value for 'choices'. Full response keys: ['id']"
+                raise TypeError(msg)
+            return {"ok": True}
+
+    module = types.ModuleType("langchain_qwq")
+    module.ChatQwen = FakeChatQwen
+    monkeypatch.setitem(sys.modules, "langchain_qwq", module)
+
+    model = build_chat_qwen(FsAgentEnv(available_models_json="missing.json"))
+
+    result = model._generate([])  # noqa: SLF001
+
+    assert result == {"ok": True}
+    assert calls == 3
+
+
 def test_fsagent_env_prefers_process_environment(monkeypatch, tmp_path):
     env_path = tmp_path / ".env"
     env_path.write_text("MODEL=from-file\nAPI_KEY=file-key\n", encoding="utf-8")

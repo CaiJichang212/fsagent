@@ -482,59 +482,10 @@ async def test_plan_planner_does_not_load_mcp_tools_before_review(monkeypatch):
     assert "__interrupt__" in result
 
 
-async def test_fast_mode_high_risk_mcp_interrupts_before_runner(tmp_path: Path):
+async def test_fast_mode_mcp_config_does_not_interrupt_before_tool_call(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "mcp.json"
     config_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "local-files": {
-                        "command": "python",
-                        "args": ["server.py"],
-                        "description": "Local filesystem MCP.",
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    runtime = create_runtime(
-        model=_ToolBindingFakeChatModel(messages=iter([AIMessage(content="done")])),
-        mcp_config_path=str(config_path),
-        trust_project_mcp=True,
-        checkpointer=InMemorySaver(),
-    )
-
-    result = await runtime.ainvoke(
-        {"mode": "fast", "messages": [HumanMessage(content="hello")]},
-        config={"configurable": {"thread_id": "fast-mcp-review-thread"}},
-    )
-
-    assert "__interrupt__" in result
-    interrupt = result["__interrupt__"][0].value
-    assert interrupt["kind"] == "mcp_review"
-    assert interrupt["risk"] == "high"
-    assert "local-files (stdio, high)" in interrupt["proposed_input_summary"]
-
-
-@pytest.mark.parametrize(
-    ("action", "expected_status", "expected_final_response"),
-    [
-        ("approve", None, "done"),
-        ("deny", "needs_revision", None),
-        ("cancel", "cancelled", None),
-    ],
-)
-async def test_fast_mode_mcp_review_resume_actions_update_state(
-    monkeypatch,
-    tmp_path: Path,
-    action: str,
-    expected_status: str | None,
-    expected_final_response: str | None,
-):
-    config_path = tmp_path / "mcp.json"
-    config_path.write_text(
-        json.dumps({"mcpServers": {"local-files": {"command": "python", "args": ["server.py"]}}}),
+        json.dumps({"mcpServers": {"trends-hub": {"command": "npx", "args": ["trends-hub"]}}}),
         encoding="utf-8",
     )
 
@@ -548,75 +499,34 @@ async def test_fast_mode_mcp_review_resume_actions_update_state(
         trust_project_mcp=True,
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": f"fast-mcp-review-{action}-thread"}}
 
-    first_result = await runtime.ainvoke({"mode": "fast", "messages": [HumanMessage(content="hello")]}, config=config)
-    final_result = await runtime.ainvoke(Command(resume={"action": action}), config=config)
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="hello")]},
+        config={"configurable": {"thread_id": "fast-mcp-no-server-review-thread"}},
+    )
 
-    assert first_result["__interrupt__"][0].value["kind"] == "mcp_review"
-    assert final_result["mcp_review_approved"] is (action == "approve")
-    if expected_status is not None:
-        assert final_result["status"] == expected_status
-    if expected_final_response is not None:
-        assert final_result["final_response"] == expected_final_response
+    assert "__interrupt__" not in result
+    assert result["final_response"] == "done"
 
 
-async def test_fast_mode_mcp_review_deny_does_not_approve_future_same_thread_invokes(
-    monkeypatch,
-    tmp_path: Path,
-):
+async def test_fast_mode_high_risk_mcp_tool_uses_tool_review(monkeypatch, tmp_path: Path):
+    @tool
+    def filesystem_delete_file(path: str) -> str:
+        """Delete a local file."""
+        return f"deleted {path}"
+
+    filesystem_delete_file.metadata = {"fsagent_tool_source": "mcp", "fsagent_tool_risk": "high"}
+
     config_path = tmp_path / "mcp.json"
     config_path.write_text(
         json.dumps({"mcpServers": {"local-files": {"command": "python", "args": ["server.py"]}}}),
         encoding="utf-8",
     )
-    load_calls = 0
 
-    async def fail_if_mcp_loads_after_denial(*_args: object, **_kwargs: object) -> RuntimeMCPResult:
-        nonlocal load_calls
-        load_calls += 1
-        msg = "Denied MCP review must not load MCP tools on a later same-thread invoke."
-        raise AssertionError(msg)
+    async def fake_load_runtime_mcp_tools(*_args: object, **_kwargs: object) -> RuntimeMCPResult:
+        return RuntimeMCPResult(tools=[filesystem_delete_file])
 
-    monkeypatch.setattr("fsagent.runtime.graph.load_runtime_mcp_tools", fail_if_mcp_loads_after_denial)
-    runtime = create_runtime(
-        model=_ToolBindingFakeChatModel(messages=iter([AIMessage(content="done")])),
-        mcp_config_path=str(config_path),
-        trust_project_mcp=True,
-        checkpointer=InMemorySaver(),
-    )
-    config = {"configurable": {"thread_id": "fast-mcp-review-deny-repeat-thread"}}
-
-    first_result = await runtime.ainvoke({"mode": "fast", "messages": [HumanMessage(content="hello")]}, config=config)
-    denied_result = await runtime.ainvoke(Command(resume={"action": "deny"}), config=config)
-    repeat_result = await runtime.ainvoke(
-        {"mode": "fast", "messages": [HumanMessage(content="hello again")]},
-        config=config,
-    )
-
-    assert first_result["__interrupt__"][0].value["kind"] == "mcp_review"
-    assert denied_result["mcp_review_approved"] is False
-    assert repeat_result["__interrupt__"][0].value["kind"] == "mcp_review"
-    assert load_calls == 0
-
-
-async def test_plan_mode_high_risk_mcp_interrupts_after_plan_review(tmp_path: Path):
-    config_path = tmp_path / "mcp.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "local-files": {
-                        "type": "stdio",
-                        "command": "python",
-                        "args": ["server.py"],
-                        "description": "Local filesystem MCP.",
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    monkeypatch.setattr("fsagent.runtime.graph.load_runtime_mcp_tools", fake_load_runtime_mcp_tools)
     model = _ToolBindingFakeChatModel(
         messages=iter(
             [
@@ -624,13 +534,13 @@ async def test_plan_mode_high_risk_mcp_interrupts_after_plan_review(tmp_path: Pa
                     content="",
                     tool_calls=[
                         {
-                            "name": "write_todos",
-                            "args": {"todos": [{"content": "检查日志", "status": "pending"}]},
-                            "id": "call-1",
+                            "name": "filesystem_delete_file",
+                            "args": {"path": "out.txt"},
+                            "id": "call-delete",
                         }
                     ],
                 ),
-                AIMessage(content="计划已生成"),
+                AIMessage(content="done"),
             ]
         )
     )
@@ -640,13 +550,15 @@ async def test_plan_mode_high_risk_mcp_interrupts_after_plan_review(tmp_path: Pa
         trust_project_mcp=True,
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "plan-mcp-review-thread"}}
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="delete file")]},
+        config={"configurable": {"thread_id": "fast-mcp-tool-review-thread"}},
+    )
 
-    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
-    second_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
-
-    assert first_result["__interrupt__"][0].value["kind"] == "plan_review"
-    assert second_result["__interrupt__"][0].value["kind"] == "mcp_review"
+    assert "__interrupt__" in result
+    interrupt = result["__interrupt__"][0].value
+    assert interrupt["action_requests"][0]["name"] == "filesystem_delete_file"
+    assert interrupt["review_configs"][0]["allowed_decisions"] == ["approve", "edit", "reject"]
 
 
 async def test_plan_mode_deviation_review_triggers_only_from_state(monkeypatch):
@@ -693,6 +605,71 @@ async def test_plan_mode_deviation_review_triggers_only_from_state(monkeypatch):
     assert "__interrupt__" not in final_result
     assert final_result["status"] == "completed"
     assert "executor requested deviation in natural language" in final_result["final_response"]
+
+
+async def test_plan_mode_formatter_omits_unverified_executor_summary_when_revision_is_needed(monkeypatch):
+    async def fake_execute_plan(**_kwargs: object) -> object:
+        return SimpleNamespace(
+            todos=[
+                {"content": "测试 GitHub MCP 工具", "status": "failed"},
+                {"content": "汇总所有 MCP 工具的测试结果和可用性状态", "status": "completed"},
+            ],
+            execution_log=[
+                {"content": "测试 GitHub MCP 工具", "status": "failed", "error": "Tool execution requires approval"},
+                {
+                    "content": "汇总所有 MCP 工具的测试结果和可用性状态",
+                    "status": "completed",
+                    "result": "## MCP 工具测试结果和可用性状态汇总\n\nGitHub MCP 工具：✅ 可用",
+                },
+            ],
+            evidence=[],
+            final_result="## MCP 工具测试结果和可用性状态汇总\n\nGitHub MCP 工具：✅ 可用",
+            deviation_requested=False,
+            deviation_reason=None,
+        )
+
+    async def fake_verify_execution_async(**_kwargs: object) -> object:
+        return SimpleNamespace(
+            verification=[
+                {
+                    "id": "verification-001",
+                    "status": "skipped",
+                    "reason": "No verification command was provided.",
+                }
+            ],
+            status="needs_revision",
+        )
+
+    monkeypatch.setattr("fsagent.runtime.graph.create_deep_agent", lambda **_kwargs: object())
+    monkeypatch.setattr("fsagent.runtime.graph.execute_plan", fake_execute_plan)
+    monkeypatch.setattr("fsagent.runtime.graph.verify_execution_async", fake_verify_execution_async)
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_todos",
+                            "args": {"todos": [{"content": "测试 GitHub MCP 工具", "status": "pending"}]},
+                            "id": "call-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="计划已生成"),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, no_mcp=True, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "formatter-needs-revision-thread"}}
+
+    first_result = await runtime.ainvoke({"mode": "plan", "messages": [HumanMessage(content="hello")]}, config=config)
+    final_result = await runtime.ainvoke(Command(resume={"action": "approve"}), config=config)
+
+    assert "__interrupt__" in first_result
+    assert final_result["status"] == "needs_revision"
+    assert "Execution requires revision." in final_result["final_response"]
+    assert "GitHub MCP 工具：✅ 可用" not in final_result["final_response"]
 
 
 @pytest.mark.parametrize(
@@ -832,6 +809,49 @@ async def test_fast_mode_write_tool_uses_hitl_interrupt():
     interrupt = result["__interrupt__"][0].value
     assert interrupt["action_requests"][0]["name"] == "write_file"
     assert interrupt["review_configs"][0]["allowed_decisions"] == ["approve", "edit", "reject"]
+
+
+async def test_fast_mode_suppresses_tool_calls_after_tool_round_is_used():
+    @tool
+    def read_file(path: str) -> str:
+        """Read a file."""
+        return f"contents of {path}"
+
+    model = _ToolBindingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "read_file",
+                            "args": {"path": "README.md"},
+                            "id": "call-read",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "unknown",
+                            "args": {},
+                            "id": "call-late",
+                        }
+                    ],
+                ),
+            ]
+        )
+    )
+    runtime = create_runtime(model=model, tools=[read_file], no_mcp=True)
+
+    result = await runtime.ainvoke(
+        {"mode": "fast", "messages": [HumanMessage(content="read then answer")]},
+        config={"configurable": {"thread_id": "fast-post-round-tool-call-thread"}},
+    )
+
+    assert "Unknown tools are denied by default" not in result["final_response"]
+    assert "Fast 模式已使用过一次工具调用" in result["final_response"]
 
 
 async def test_plan_executor_delegates_hitl_installation_to_deep_agent(monkeypatch):

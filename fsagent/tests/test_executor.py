@@ -1,5 +1,10 @@
+import pytest
+from langgraph.errors import GraphInterrupt
+
 from fsagent.runtime.executor import execute_plan
 from fsagent.runtime.prompts import EXECUTOR_SYSTEM_PROMPT
+
+INTERRUPT_MESSAGE = "Tool execution requires approval"
 
 
 class RecordingAgent:
@@ -13,6 +18,11 @@ class RecordingAgent:
         self.states.append(state)
         self.configs.append(config)
         return {"messages": [*state["messages"], state["messages"][-1]], "final_response": "done"}
+
+
+class InterruptingAgent:
+    async def ainvoke(self, _state, **_kwargs: object):
+        raise GraphInterrupt(INTERRUPT_MESSAGE)
 
 
 async def test_execute_plan_records_precompleted_items_as_skipped():
@@ -39,6 +49,14 @@ async def test_execute_plan_records_precompleted_items_as_skipped():
     assert result.execution_log[1]["result"] == "done"
 
 
+async def test_execute_plan_propagates_hitl_interrupts():
+    with pytest.raises(GraphInterrupt, match=INTERRUPT_MESSAGE):
+        await execute_plan(
+            agent=InterruptingAgent(),
+            todos=[{"content": "测试 GitHub MCP 工具", "status": "pending"}],
+        )
+
+
 async def test_execute_plan_emits_progress_events():
     agent = RecordingAgent()
     events: list[dict[str, object]] = []
@@ -59,6 +77,32 @@ async def test_execute_plan_emits_progress_events():
     assert events[1]["execution_log"][0]["content"] == "运行联调"
     assert events[1]["execution_log"][0]["status"] == "completed"
     assert events[1]["execution_log"][0]["result"] == "done"
+
+
+async def test_execute_plan_todo_progress_events_include_stable_identity():
+    agent = RecordingAgent()
+    events: list[dict[str, object]] = []
+
+    async def on_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    await execute_plan(
+        agent=agent,
+        todos=[
+            {"content": "测试docs-langchain工具的基本功能", "status": "pending"},
+            {"content": "测试hf-mcp工具的基本功能", "status": "pending"},
+        ],
+        on_event=on_event,
+    )
+
+    todo_events = [event for event in events if str(event["kind"]).startswith("todo.")]
+
+    assert [(event["kind"], event["todo_id"], event["todo_index"], event["todo_content"]) for event in todo_events] == [
+        ("todo.started", "todo-001", 1, "测试docs-langchain工具的基本功能"),
+        ("todo.completed", "todo-001", 1, "测试docs-langchain工具的基本功能"),
+        ("todo.started", "todo-002", 2, "测试hf-mcp工具的基本功能"),
+        ("todo.completed", "todo-002", 2, "测试hf-mcp工具的基本功能"),
+    ]
 
 
 async def test_execute_plan_invokes_agent_with_only_current_todo_state():

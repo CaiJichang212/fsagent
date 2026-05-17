@@ -71,6 +71,29 @@ def test_fast_tool_round_middleware_disables_tools_after_first_round():
     ]
 
 
+def test_fast_tool_round_middleware_suppresses_post_round_tool_calls():
+    middleware = FastToolRoundMiddleware()
+    request = ModelRequest(
+        model=FakeListChatModel(responses=[""]),
+        messages=[],
+        tools=[sample_tool],
+        state={"messages": [], "fast_tool_round_used": True},
+    )
+
+    def handler(next_request: ModelRequest) -> ModelResponse:
+        assert next_request.tools == []
+        return ModelResponse(
+            result=[AIMessage(content="", tool_calls=[{"name": "sample_tool", "args": {"value": "x"}, "id": "late"}])]
+        )
+
+    response = middleware.wrap_model_call(request, handler)
+
+    assert isinstance(response, ModelResponse)
+    assert isinstance(response.result[0], AIMessage)
+    assert response.result[0].content
+    assert response.result[0].tool_calls == []
+
+
 async def test_run_fast_emits_agent_started_and_completed_events():
     events: list[dict[str, object]] = []
 

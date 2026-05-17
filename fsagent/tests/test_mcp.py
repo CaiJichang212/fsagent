@@ -1,5 +1,6 @@
 import json
 import sys
+from types import ModuleType
 
 from anyio import Path as AsyncPath
 from langchain_core.tools import StructuredTool
@@ -37,7 +38,7 @@ async def test_load_runtime_mcp_tools_delegates_to_deepagents_cli_loader(monkeyp
 
 def test_import_deepagents_cli_mcp_tools_falls_back_to_repo_source(monkeypatch):
     imported: list[str] = []
-    fake_module = object()
+    fake_module = ModuleType("deepagents_cli.mcp_tools")
 
     def fake_import_module(name: str) -> object:
         imported.append(name)
@@ -54,6 +55,24 @@ def test_import_deepagents_cli_mcp_tools_falls_back_to_repo_source(monkeypatch):
     assert result is fake_module
     assert imported == ["deepagents_cli.mcp_tools", "deepagents_cli.mcp_tools"]
     assert sys.path[0] == "/repo/libs/cli"
+
+
+def test_import_deepagents_mcp_tools_uses_code_module_when_cli_module_is_missing(monkeypatch):
+    imported: list[str] = []
+    fake_module = ModuleType("deepagents_code.mcp_tools")
+
+    def fake_import_module(name: str) -> object:
+        imported.append(name)
+        if name == "deepagents_cli.mcp_tools":
+            raise ModuleNotFoundError(name="deepagents_cli.mcp_tools")
+        return fake_module
+
+    monkeypatch.setattr(mcp.importlib, "import_module", fake_import_module)
+
+    result = mcp._import_deepagents_cli_mcp_tools()  # noqa: SLF001
+
+    assert result is fake_module
+    assert imported == ["deepagents_cli.mcp_tools", "deepagents_code.mcp_tools"]
 
 
 async def test_load_runtime_mcp_tools_honors_no_mcp(tmp_path):
@@ -157,10 +176,89 @@ async def test_load_runtime_mcp_tools_returns_tool_errors_to_model(monkeypatch, 
     result = await load_runtime_mcp_tools(str(config))
 
     assert result.tools[0].metadata["fsagent_tool_source"] == "mcp"
-    assert result.tools[0].metadata["fsagent_tool_risk"] == "medium"
+    assert result.tools[0].metadata["fsagent_tool_risk"] == "low"
     output = await result.tools[0].ainvoke({})
     assert "forbidden_tool" in output
     assert "403" in output
+
+
+async def test_load_runtime_mcp_tools_infers_read_only_and_destructive_tool_risk(monkeypatch, tmp_path):
+    config = tmp_path / "mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"trends": {"command": "npx", "args": ["trends-hub"]}}}))
+
+    async def sample_tool() -> str:
+        """Return a sample response."""
+        return "ok"
+
+    news_tool = StructuredTool.from_function(
+        coroutine=sample_tool,
+        name="trends-hub_get-bbc-news",
+        description="Get BBC news headlines.",
+    )
+    delete_tool = StructuredTool.from_function(
+        coroutine=sample_tool,
+        name="filesystem_delete_file",
+        description="Delete a local file.",
+    )
+    rename_tool = StructuredTool.from_function(
+        coroutine=sample_tool,
+        name="filesystem_rename",
+        description="Rename a local file.",
+    )
+    send_tool = StructuredTool.from_function(
+        coroutine=sample_tool,
+        name="email_send",
+        description="Send email.",
+    )
+
+    async def fake_resolve_and_load_mcp_tools(
+        **kwargs: object,
+    ) -> tuple[list[StructuredTool], str, list[str]]:
+        del kwargs
+        return [news_tool, delete_tool, rename_tool, send_tool], "manager", []
+
+    monkeypatch.setattr(mcp, "_resolve_and_load_mcp_tools", fake_resolve_and_load_mcp_tools)
+
+    result = await load_runtime_mcp_tools(str(config), trust_project_mcp=True)
+
+    risks = {tool.name: tool.metadata["fsagent_tool_risk"] for tool in result.tools}
+    assert risks == {
+        "trends-hub_get-bbc-news": "low",
+        "filesystem_delete_file": "high",
+        "filesystem_rename": "high",
+        "email_send": "high",
+    }
+
+
+async def test_load_runtime_mcp_tools_keeps_search_tools_with_schema_sort_fields_low_risk(monkeypatch, tmp_path):
+    config = tmp_path / "mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"hf-mcp": {"url": "https://example.test/mcp"}}}))
+
+    async def sample_tool() -> str:
+        """Return a sample response."""
+        return "ok"
+
+    search_tool = StructuredTool.from_function(
+        coroutine=sample_tool,
+        name="hf-mcp_hub_repo_search",
+        description=(
+            "Search Hugging Face repositories. Sort order descending: "
+            "trendingScore, downloads, likes, createdAt, lastModified."
+        ),
+    )
+
+    async def fake_resolve_and_load_mcp_tools(
+        **kwargs: object,
+    ) -> tuple[list[StructuredTool], str, list[str]]:
+        del kwargs
+        return [search_tool], "manager", []
+
+    monkeypatch.setattr(mcp, "_resolve_and_load_mcp_tools", fake_resolve_and_load_mcp_tools)
+
+    result = await load_runtime_mcp_tools(str(config), trust_project_mcp=True)
+
+    assert result.tools[0].metadata["fsagent_tool_source"] == "mcp"
+    assert result.tools[0].metadata["fsagent_tool_risk"] == "low"
 
 
 async def test_load_runtime_mcp_tools_returns_unexpected_tool_errors_to_model(monkeypatch, tmp_path):

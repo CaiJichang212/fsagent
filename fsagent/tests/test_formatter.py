@@ -84,3 +84,43 @@ def test_format_final_report_lists_verification_records_or_skipped_reason():
 
     assert "## Verification" in report
     assert "- verification-001: skipped - No verification command was provided." in report
+
+
+def test_format_final_report_hides_unverified_success_summary_when_revision_is_needed():
+    report = format_final_report(
+        status="needs_revision",
+        result="## MCP 工具测试结果和可用性状态汇总\n\nGitHub MCP 工具：✅ 可用",
+        todos=[
+            {"content": "测试 GitHub MCP 工具", "status": "failed"},
+            {"content": "汇总所有 MCP 工具的测试结果和可用性状态", "status": "completed"},
+        ],
+        execution_log=[
+            {"content": "测试 GitHub MCP 工具", "status": "failed", "error": "Tool execution requires approval"},
+            {
+                "content": "汇总所有 MCP 工具的测试结果和可用性状态",
+                "status": "completed",
+                "result": "## MCP 工具测试结果和可用性状态汇总\n\nGitHub MCP 工具：✅ 可用",
+            },
+        ],
+    )
+
+    assert "Execution requires revision." in report
+    assert "Agent-authored completion summary was omitted" in report
+    assert "GitHub MCP 工具：✅ 可用" not in report
+
+
+def test_format_final_report_compacts_multiline_completed_markdown_in_execution_summary():
+    report = format_final_report(
+        result="## MCP 工具测试结果和可用性状态汇总\n\n- GitHub",
+        todos=[{"content": "汇总所有 MCP 工具的测试结果和可用性状态", "status": "completed"}],
+        execution_log=[
+            {
+                "content": "汇总所有 MCP 工具的测试结果和可用性状态",
+                "status": "completed",
+                "result": "## MCP 工具测试结果和可用性状态汇总\n\n- GitHub",
+            }
+        ],
+    )
+
+    assert "Detailed output captured in Result section." in report
+    assert report.count("## MCP 工具测试结果和可用性状态汇总") == 1

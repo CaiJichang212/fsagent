@@ -670,6 +670,54 @@ def test_langchain_hitl_tool_interrupt_payload_becomes_review_record():
     assert "execute" in review["proposedInputSummary"]
 
 
+def test_langchain_hitl_destructive_tool_interrupt_is_high_risk():
+    interrupt = SimpleNamespace(
+        value={
+            "action_requests": [
+                {
+                    "name": "filesystem_delete_file",
+                    "args": {"path": "out.txt"},
+                    "description": "Tool execution requires approval\n\nTool: filesystem_delete_file",
+                }
+            ],
+            "review_configs": [
+                {"action_name": "filesystem_delete_file", "allowed_decisions": ["approve", "edit", "reject"]}
+            ],
+        }
+    )
+    runtime = FakeRuntime([{"__interrupt__": [interrupt]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    assert response.json()["pendingReview"]["risk"] == "high"
+
+
+def test_langchain_hitl_descriptive_destructive_tool_interrupt_is_high_risk():
+    interrupt = SimpleNamespace(
+        value={
+            "action_requests": [
+                {
+                    "name": "github_pr",
+                    "args": {"number": 1},
+                    "description": "Tool execution requires approval\n\nMerge a pull request.",
+                }
+            ],
+            "review_configs": [{"action_name": "github_pr", "allowed_decisions": ["approve", "edit", "reject"]}],
+        }
+    )
+    runtime = FakeRuntime([{"__interrupt__": [interrupt]}])
+    service = _service(runtime)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload(mode="plan"))
+
+    assert response.status_code == 200
+    assert response.json()["pendingReview"]["risk"] == "high"
+
+
 def test_tool_interrupt_with_subject_preserves_hitl_action_requests():
     interrupt = SimpleNamespace(
         value={

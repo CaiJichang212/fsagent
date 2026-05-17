@@ -12,11 +12,14 @@ async def _sample_tool() -> str:
 
 def test_default_policy_allows_read_reviews_execute_and_denies_unknown():
     read_decision = evaluate_tool_policy("read_file", profile="dev-default", phase="executor")
+    write_decision = evaluate_tool_policy("write_file", profile="dev-default", phase="executor")
     execute_decision = evaluate_tool_policy("execute", profile="dev-default", phase="executor")
     unknown_decision = evaluate_tool_policy("unknown_tool", profile="dev-default", phase="executor")
 
     assert read_decision.risk == "low"
     assert read_decision.action == "allow"
+    assert write_decision.risk == "high"
+    assert write_decision.action == "review"
     assert execute_decision.risk == "high"
     assert execute_decision.action == "review"
     assert unknown_decision.risk == "high"
@@ -73,6 +76,49 @@ def test_policy_interrupts_are_built_from_actual_tool_names_and_merge_existing_r
     assert interrupt_on["execute"] == {"allowed_decisions": ["approve", "edit", "reject"]}
     assert interrupt_on["write_file"] == {"allowed_decisions": ["approve", "reject"]}
     assert "read_file" not in interrupt_on
+
+
+def test_policy_interrupts_builtin_write_tools_as_high_risk():
+    write_tool = StructuredTool.from_function(coroutine=_sample_tool, name="write_file", description="Write file.")
+    edit_tool = StructuredTool.from_function(coroutine=_sample_tool, name="edit_file", description="Edit file.")
+
+    interrupt_on = policy_interrupt_on_for_tools([write_tool, edit_tool], profile="dev-default", phase="executor")
+
+    assert interrupt_on["write_file"] == {"allowed_decisions": ["approve", "edit", "reject"]}
+    assert interrupt_on["edit_file"] == {"allowed_decisions": ["approve", "edit", "reject"]}
+
+
+def test_policy_interrupts_only_high_risk_mcp_tools():
+    news_tool = StructuredTool.from_function(
+        coroutine=_sample_tool,
+        name="trends-hub_get-bbc-news",
+        description="Get BBC news headlines.",
+        metadata={"fsagent_tool_source": "mcp", "fsagent_tool_risk": "low"},
+    )
+    delete_tool = StructuredTool.from_function(
+        coroutine=_sample_tool,
+        name="filesystem_delete_file",
+        description="Delete a local file.",
+        metadata={"fsagent_tool_source": "mcp", "fsagent_tool_risk": "high"},
+    )
+
+    interrupt_on = policy_interrupt_on_for_tools([news_tool, delete_tool], profile="dev-default")
+
+    assert "trends-hub_get-bbc-news" not in interrupt_on
+    assert interrupt_on["filesystem_delete_file"] == {"allowed_decisions": ["approve", "edit", "reject"]}
+
+
+def test_locked_down_policy_allows_low_risk_mcp_tools():
+    news_tool = StructuredTool.from_function(
+        coroutine=_sample_tool,
+        name="trends-hub_get-bbc-news",
+        description="Get BBC news headlines.",
+        metadata={"fsagent_tool_source": "mcp", "fsagent_tool_risk": "low"},
+    )
+
+    interrupt_on = policy_interrupt_on_for_tools([news_tool], profile="locked-down")
+
+    assert "trends-hub_get-bbc-news" not in interrupt_on
 
 
 def test_policy_interrupts_cannot_be_weakened_by_caller_base_config():
