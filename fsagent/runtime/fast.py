@@ -27,8 +27,7 @@ from fsagent.runtime.prompts import FAST_SYSTEM_PROMPT
 from fsagent.runtime.state import RuntimeState
 
 _FAST_TOOL_LIMIT_FALLBACK = (
-    "Fast 模式已使用过一次工具调用, 后续工具调用已被忽略。"
-    "请切换 Plan 模式或重新发起任务以检查更多工具。"
+    "Fast 模式已使用过一次工具调用, 后续工具调用已被忽略。请切换 Plan 模式或重新发起任务以检查更多工具。"
 )
 
 
