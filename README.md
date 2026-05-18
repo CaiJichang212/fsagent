@@ -76,6 +76,13 @@ FSAGENT_SESSION_STORE_PATH=logs/fsagent-sessions.jsonl
 FSAGENT_CHECKPOINTER_PATH=logs/fsagent-checkpoints.sqlite
 FSAGENT_LOG_LEVEL=INFO
 FSAGENT_LOG_FILE=logs/fsagent-api.jsonl
+FSAGENT_LANGFUSE_ENABLED=false
+LANGFUSE_PUBLIC_KEY=pk-lf-example
+LANGFUSE_SECRET_KEY=sk-lf-example
+LANGFUSE_BASE_URL=http://127.0.0.1:13000
+LANGFUSE_TRACING_ENABLED=true
+LANGFUSE_SAMPLE_RATE=1.0
+LANGFUSE_DEBUG=false
 ```
 
 说明：
@@ -85,6 +92,9 @@ FSAGENT_LOG_FILE=logs/fsagent-api.jsonl
 - `FSAGENT_SESSION_STORE_PATH`：设置后启用 `JsonlSessionStore`；未设置时使用 `InMemorySessionStore`。
 - `FSAGENT_CHECKPOINTER_PATH`：当前只作为 checkpoint reference 被记录，不会自动启用完整的 LangGraph 持久化恢复。
 - `FSAGENT_LOG_LEVEL`、`FSAGENT_LOG_FILE`：控制 JSONL 日志级别与输出位置。
+- `FSAGENT_LANGFUSE_ENABLED`：设为 `true` 且同时提供 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 后，后端会把 Fast/Plan runtime 调用和 LangChain/DeepAgents span 发送到 Langfuse。
+- `LANGFUSE_BASE_URL`：自托管 Langfuse 地址；本地 Docker 映射可使用 `http://127.0.0.1:13000`。
+- `LANGFUSE_SAMPLE_RATE`、`LANGFUSE_DEBUG`：分别控制采样率和 SDK 调试日志。
 
 ## 运行
 
@@ -130,6 +140,29 @@ uv run fsagent-api
 
 ```bash
 uv run uvicorn fsagent.api.server:app --host 127.0.0.1 --port 8000 --reload --no-access-log
+```
+
+### 启用 Langfuse
+
+1. 打开本地 Langfuse：`http://127.0.0.1:13000`。
+2. 在 Langfuse 项目设置中创建 API keys。
+3. 在 `.env` 中设置：
+
+```bash
+FSAGENT_LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-your-local-project-key
+LANGFUSE_SECRET_KEY=sk-lf-your-local-project-key
+LANGFUSE_BASE_URL=http://127.0.0.1:13000
+```
+
+4. 启动 API 或一键开发脚本。
+5. 发起一次 `/fast` 或 `/plan` run 后，在 Langfuse trace table 中按 tag `fsagent` 或 metadata `thread_id` 过滤。
+
+自托管版本需与当前 Langfuse Python SDK 兼容。若没有 trace 出现，先检查 Langfuse UI 中显示的平台版本，再运行：
+
+```bash
+curl -sS http://127.0.0.1:13000/api/public/health
+curl -sS http://127.0.0.1:13000/api/public/ready
 ```
 
 ### 单独启动前端
