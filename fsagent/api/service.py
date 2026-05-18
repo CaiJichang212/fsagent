@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Iterator, Protocol
+from typing import Protocol
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
