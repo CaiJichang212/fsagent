@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,67 @@ class FakeRuntime:
     async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
         self.calls.append((payload, config))
         return self.outputs.pop(0)
+
+
+class FakeLangfuseBridge:
+    def __init__(self) -> None:
+        self.observed: list[dict[str, object]] = []
+        self.observations: list[FakeLangfuseObservation] = []
+        self.shutdown_called = False
+
+    def callback_handler(self) -> object:
+        return "langfuse-callback"
+
+    @contextmanager
+    def observe_run(self, **kwargs: object):
+        self.observed.append(dict(kwargs))
+        observation = FakeLangfuseObservation()
+        self.observations.append(observation)
+        yield observation
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class FakeLangfuseObservation:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, object]] = []
+
+    def update(self, **kwargs: object) -> None:
+        self.updates.append(dict(kwargs))
+
+
+class FailingLangfuseBridge(FakeLangfuseBridge):
+    def __init__(self, *, fail_callback: bool = False, fail_observe_enter: bool = False, fail_update: bool = False) -> None:
+        super().__init__()
+        self.fail_callback = fail_callback
+        self.fail_observe_enter = fail_observe_enter
+        self.fail_update = fail_update
+
+    def callback_handler(self) -> object:
+        if self.fail_callback:
+            raise RuntimeError("langfuse callback unavailable")
+        return super().callback_handler()
+
+    @contextmanager
+    def observe_run(self, **kwargs: object):
+        if self.fail_observe_enter:
+            raise RuntimeError("langfuse observe unavailable")
+        self.observed.append(dict(kwargs))
+        observation = FailingLangfuseObservation(fail_update=self.fail_update)
+        self.observations.append(observation)
+        yield observation
+
+
+class FailingLangfuseObservation(FakeLangfuseObservation):
+    def __init__(self, *, fail_update: bool) -> None:
+        super().__init__()
+        self.fail_update = fail_update
+
+    def update(self, **kwargs: object) -> None:
+        if self.fail_update:
+            raise RuntimeError("langfuse update unavailable")
+        super().update(**kwargs)
 
 
 class GateResumeRuntime:
@@ -177,6 +239,87 @@ def test_create_run_uses_configured_checkpoint_ref():
     stored = store.get(body["sessionId"])
     assert runtime.calls[0][1]["checkpoint_ref"] == checkpoint_ref
     assert stored.checkpoint_ref == checkpoint_ref
+
+
+def test_create_run_injects_langfuse_callback_and_observes_runtime_call():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    langfuse = FakeLangfuseBridge()
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    runtime_config = runtime.calls[0][1]
+    assert runtime_config["callbacks"] == ["langfuse-callback"]
+    assert langfuse.observed[0]["session_id"] == response.json()["sessionId"]
+    assert langfuse.observed[0]["thread_id"] == response.json()["threadId"]
+    assert langfuse.observed[0]["mode"] == "fast"
+    assert langfuse.observed[0]["operation"] == "invoke"
+    assert langfuse.observations[0].updates == [{"output": {"keys": ["final_response"]}}]
+    assert "fast result" not in repr(langfuse.observations[0].updates)
+
+
+def test_create_run_preserves_existing_callbacks_when_injecting_langfuse_callback():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    langfuse = FakeLangfuseBridge()
+
+    class CallbackService(FsAgentApiService):
+        def _create_record(self, request: RunRequest):
+            record = super()._create_record(request)
+            record.config["callbacks"] = ["existing-callback"]
+            return record
+
+    service = CallbackService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    assert runtime.calls[0][1]["callbacks"] == ["existing-callback", "langfuse-callback"]
+
+
+def test_create_run_ignores_langfuse_callback_failures():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    langfuse = FailingLangfuseBridge(fail_callback=True)
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["finalResponse"] == "fast result"
+    assert len(runtime.calls) == 1
+    assert "callbacks" not in runtime.calls[0][1]
+
+
+def test_create_run_ignores_langfuse_observation_failures():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    langfuse = FailingLangfuseBridge(fail_observe_enter=True)
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["finalResponse"] == "fast result"
+    assert len(runtime.calls) == 1
+
+
+def test_create_run_ignores_langfuse_observation_update_failures():
+    runtime = FakeRuntime([{"final_response": "fast result"}])
+    langfuse = FailingLangfuseBridge(fail_update=True)
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["finalResponse"] == "fast result"
+    assert len(runtime.calls) == 1
 
 
 def test_create_run_normalizes_legacy_contract_records_with_stable_ids():
