@@ -6,9 +6,10 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Iterator, Protocol
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
@@ -35,6 +36,7 @@ from fsagent.api.schemas import (
     ToolCallRecord,
     VerificationRecord,
 )
+from fsagent.langfuse_integration import LangfuseBridge, _summarize_payload_for_langfuse
 from fsagent.observability import RunLogContext, RunLogger, get_logger
 from fsagent.runtime.assembly import RuntimeAssemblyConfig, resolve_runtime_assembly
 from fsagent.runtime.graph import create_runtime
@@ -90,12 +92,18 @@ class FsAgentApiService:
         *,
         session_store: SessionStore | None = None,
         checkpoint_ref: str | None = None,
+        langfuse_bridge: LangfuseBridge | None = None,
     ) -> None:
         """Initialize the service with an optional runtime factory."""
         self._runtime_factory = runtime_factory or self._default_runtime_factory
         self._session_store = session_store or InMemorySessionStore()
         self._checkpoint_ref = checkpoint_ref
+        self._langfuse = langfuse_bridge or LangfuseBridge()
         self._sessions: dict[str, SessionRecord] = {}
+
+    def shutdown(self) -> None:
+        """Shutdown service-owned integrations."""
+        self._langfuse.shutdown()
 
     async def create_run(self, request: RunRequest) -> SessionResponse:
         """Create and invoke a Fast or Plan run."""
@@ -475,11 +483,13 @@ class FsAgentApiService:
         *,
         default_status: str = "completed",
     ) -> None:
-        try:
-            result = await record.runtime.ainvoke(payload, config=self._runtime_config(record))
-        except Exception as exc:  # noqa: BLE001
-            self._mark_failed(record, exc)
-            return
+        with self._observe_runtime_call(record, payload, operation="invoke") as observation:
+            try:
+                result = await record.runtime.ainvoke(payload, config=self._runtime_config(record))
+            except Exception as exc:  # noqa: BLE001
+                self._mark_failed(record, exc)
+                return
+            self._update_langfuse_observation(record, observation, result)
 
         self._apply_runtime_result(record, result, default_status=default_status)
 
@@ -497,15 +507,17 @@ class FsAgentApiService:
             await queue.put(_snapshot(record.session))
 
         async def run() -> None:
-            try:
-                result = await record.runtime.ainvoke(
-                    payload,
-                    config=self._runtime_config(record, on_progress=on_progress),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._mark_failed(record, exc)
-            else:
-                self._apply_runtime_result(record, result, default_status=default_status)
+            with self._observe_runtime_call(record, payload, operation="stream") as observation:
+                try:
+                    result = await record.runtime.ainvoke(
+                        payload,
+                        config=self._runtime_config(record, on_progress=on_progress),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._mark_failed(record, exc)
+                else:
+                    self._update_langfuse_observation(record, observation, result)
+                    self._apply_runtime_result(record, result, default_status=default_status)
             await queue.put(_snapshot(record.session))
             await queue.put(None)
 
@@ -558,13 +570,106 @@ class FsAgentApiService:
                 if inspect.isawaitable(callback_result):
                     await callback_result
 
-        return {
+        config: dict[str, object] = {
             **record.config,
             "metadata": {
                 **dict(record.config.get("metadata") or {}),
                 "fsagent_event_sink": event_sink,
             },
         }
+        callbacks = _callbacks(record.config.get("callbacks"))
+        langfuse_callback = self._langfuse_callback_handler(record)
+        if langfuse_callback is not None:
+            callbacks.append(langfuse_callback)
+        if callbacks:
+            config["callbacks"] = callbacks
+        return config
+
+    def _langfuse_callback_handler(self, record: SessionRecord) -> object | None:
+        try:
+            return self._langfuse.callback_handler()
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(
+                record,
+                "langfuse.callback_failed",
+                "Langfuse callback setup failed; continuing without tracing callback.",
+                exc,
+            )
+            return None
+
+    @contextmanager
+    def _observe_runtime_call(
+        self,
+        record: SessionRecord,
+        payload: object,
+        *,
+        operation: str,
+    ) -> Iterator[object | None]:
+        try:
+            context = self._langfuse.observe_run(
+                session_id=record.session.session_id,
+                thread_id=record.session.thread_id,
+                mode=record.session.mode,
+                model=record.session.model,
+                operation=operation,
+                input_payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(record, "langfuse.observe_failed", "Langfuse observation failed.", exc)
+            yield None
+            return
+
+        try:
+            observation = context.__enter__()
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(record, "langfuse.observe_failed", "Langfuse observation failed.", exc)
+            yield None
+            return
+
+        body_error: BaseException | None = None
+        try:
+            yield observation
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            self._exit_langfuse_observation(record, context, body_error)
+
+    def _exit_langfuse_observation(
+        self,
+        record: SessionRecord,
+        context: AbstractContextManager[object | None],
+        body_error: BaseException | None,
+    ) -> None:
+        try:
+            if body_error is None:
+                context.__exit__(None, None, None)
+            else:
+                context.__exit__(type(body_error), body_error, body_error.__traceback__)
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(record, "langfuse.observe_failed", "Langfuse observation failed.", exc)
+
+    def _update_langfuse_observation(
+        self,
+        record: SessionRecord,
+        observation: object | None,
+        result: Mapping[str, object],
+    ) -> None:
+        if observation is None:
+            return
+        try:
+            observation.update(output=_summarize_payload_for_langfuse(result))
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(record, "langfuse.update_failed", "Langfuse observation update failed.", exc)
+
+    def _log_langfuse_exception(
+        self,
+        record: SessionRecord,
+        event: str,
+        message: str,
+        error: Exception,
+    ) -> None:
+        record.logger.exception(event, message, error)
 
     @staticmethod
     def _default_runtime_factory(
