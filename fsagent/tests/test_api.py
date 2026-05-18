@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from fsagent.api.persistence import InMemorySessionStore
 from fsagent.api.schemas import RunRequest, SessionResponse
 from fsagent.api.server import create_app
-from fsagent.api.service import FsAgentApiService
+from fsagent.api.service import FsAgentApiService, SessionRecord
 from fsagent.runtime.reviews import build_deviation_review_payload, build_mcp_review_payload
 
 
@@ -51,7 +51,13 @@ class FakeLangfuseObservation:
 
 
 class FailingLangfuseBridge(FakeLangfuseBridge):
-    def __init__(self, *, fail_callback: bool = False, fail_observe_enter: bool = False, fail_update: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_callback: bool = False,
+        fail_observe_enter: bool = False,
+        fail_update: bool = False,
+    ) -> None:
         super().__init__()
         self.fail_callback = fail_callback
         self.fail_observe_enter = fail_observe_enter
@@ -59,13 +65,15 @@ class FailingLangfuseBridge(FakeLangfuseBridge):
 
     def callback_handler(self) -> object:
         if self.fail_callback:
-            raise RuntimeError("langfuse callback unavailable")
+            message = "langfuse callback unavailable"
+            raise RuntimeError(message)
         return super().callback_handler()
 
     @contextmanager
     def observe_run(self, **kwargs: object):
         if self.fail_observe_enter:
-            raise RuntimeError("langfuse observe unavailable")
+            message = "langfuse observe unavailable"
+            raise RuntimeError(message)
         self.observed.append(dict(kwargs))
         observation = FailingLangfuseObservation(fail_update=self.fail_update)
         self.observations.append(observation)
@@ -79,7 +87,8 @@ class FailingLangfuseObservation(FakeLangfuseObservation):
 
     def update(self, **kwargs: object) -> None:
         if self.fail_update:
-            raise RuntimeError("langfuse update unavailable")
+            message = "langfuse update unavailable"
+            raise RuntimeError(message)
         super().update(**kwargs)
 
 
@@ -131,6 +140,18 @@ def test_health_check_returns_ok():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_app_lifespan_shuts_down_service_integrations():
+    runtime = FakeRuntime([])
+    langfuse = FakeLangfuseBridge()
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+
+    with TestClient(create_app(service)) as client:
+        response = client.get("/api/health")
+        assert response.status_code == 200
+
+    assert langfuse.shutdown_called is True
 
 
 def test_model_config_returns_available_models(monkeypatch, tmp_path):
@@ -265,7 +286,7 @@ def test_create_run_preserves_existing_callbacks_when_injecting_langfuse_callbac
     langfuse = FakeLangfuseBridge()
 
     class CallbackService(FsAgentApiService):
-        def _create_record(self, request: RunRequest):
+        def _create_record(self, request: RunRequest) -> SessionRecord:
             record = super()._create_record(request)
             record.config["callbacks"] = ["existing-callback"]
             return record
