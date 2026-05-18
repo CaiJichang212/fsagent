@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING
@@ -57,7 +58,15 @@ def create_app(service: FsAgentApiService | None = None) -> FastAPI:  # noqa: C9
         session_store=_session_store_from_env(),
         checkpoint_ref=checkpointer_config.path if checkpointer_config is not None else None,
     )
-    app = FastAPI(title="fsagent API")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            resolved_service.shutdown()
+
+    app = FastAPI(title="fsagent API", lifespan=lifespan)
     app.middleware("http")(_log_http_request)
 
     @app.get("/api/health", response_model=HealthResponse)
