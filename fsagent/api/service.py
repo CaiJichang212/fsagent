@@ -1720,6 +1720,14 @@ def _progress_log_fields(event: Mapping[str, object]) -> dict[str, object]:
     return {str(key): value for key, value in event.items() if key not in excluded}
 
 
+def _callbacks(value: object) -> list[object]:
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return list(value)
+    return [value]
+
+
 def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
