@@ -22,6 +22,13 @@ class FakeRuntime:
         return self.outputs.pop(0)
 
 
+class FailingRuntime(FakeRuntime):
+    async def ainvoke(self, payload: object, config: object = None) -> dict[str, object]:
+        self.calls.append((payload, config))
+        message = "boom"
+        raise RuntimeError(message)
+
+
 class FakeLangfuseBridge:
     def __init__(self) -> None:
         self.observed: list[dict[str, object]] = []
@@ -57,11 +64,13 @@ class FailingLangfuseBridge(FakeLangfuseBridge):
         fail_callback: bool = False,
         fail_observe_enter: bool = False,
         fail_update: bool = False,
+        fail_shutdown: bool = False,
     ) -> None:
         super().__init__()
         self.fail_callback = fail_callback
         self.fail_observe_enter = fail_observe_enter
         self.fail_update = fail_update
+        self.fail_shutdown = fail_shutdown
 
     def callback_handler(self) -> object:
         if self.fail_callback:
@@ -78,6 +87,12 @@ class FailingLangfuseBridge(FakeLangfuseBridge):
         observation = FailingLangfuseObservation(fail_update=self.fail_update)
         self.observations.append(observation)
         yield observation
+
+    def shutdown(self) -> None:
+        if self.fail_shutdown:
+            message = "langfuse shutdown unavailable"
+            raise RuntimeError(message)
+        super().shutdown()
 
 
 class FailingLangfuseObservation(FakeLangfuseObservation):
@@ -152,6 +167,16 @@ def test_app_lifespan_shuts_down_service_integrations():
         assert response.status_code == 200
 
     assert langfuse.shutdown_called is True
+
+
+def test_app_lifespan_ignores_langfuse_shutdown_failures():
+    runtime = FakeRuntime([])
+    langfuse = FailingLangfuseBridge(fail_shutdown=True)
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+
+    with TestClient(create_app(service)) as client:
+        response = client.get("/api/health")
+        assert response.status_code == 200
 
 
 def test_model_config_returns_available_models(monkeypatch, tmp_path):
@@ -341,6 +366,25 @@ def test_create_run_ignores_langfuse_observation_update_failures():
     assert response.json()["status"] == "completed"
     assert response.json()["finalResponse"] == "fast result"
     assert len(runtime.calls) == 1
+
+
+def test_create_run_records_langfuse_observation_error_when_runtime_fails():
+    runtime = FailingRuntime([])
+    langfuse = FakeLangfuseBridge()
+    service = FsAgentApiService(runtime_factory=lambda _request: runtime, langfuse_bridge=langfuse)
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/runs", json=_run_payload())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert langfuse.observations[0].updates == [
+        {
+            "level": "ERROR",
+            "status_message": "boom",
+            "output": {"error_type": "RuntimeError"},
+        }
+    ]
 
 
 def test_create_run_normalizes_legacy_contract_records_with_stable_ids():

@@ -54,7 +54,7 @@ def test_langfuse_settings_ignore_invalid_sample_rate_when_disabled():
     assert settings.sample_rate is None
 
 
-def test_langfuse_settings_raise_invalid_sample_rate_when_enabled():
+def test_langfuse_settings_disable_when_enabled_sample_rate_is_invalid():
     environ = {
         "FSAGENT_LANGFUSE_ENABLED": "true",
         "LANGFUSE_PUBLIC_KEY": "pk-lf-test",
@@ -62,8 +62,10 @@ def test_langfuse_settings_raise_invalid_sample_rate_when_enabled():
         "LANGFUSE_SAMPLE_RATE": "abc",
     }
 
-    with pytest.raises(ValueError, match="could not convert string to float"):
-        LangfuseSettings.from_env(environ)
+    settings = LangfuseSettings.from_env(environ)
+
+    assert not settings.enabled
+    assert settings.sample_rate is None
 
 
 def test_disabled_bridge_returns_no_callback_and_null_observation():
