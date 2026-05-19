@@ -16,11 +16,13 @@
   - API：`fsagent.api.server:main`
   - 开发启动器：`fsagent.dev:main`
 - 显式模式路由由 `fsagent.slash_router:parse_slash_mode` 处理，只接受带正文的 `/fast ...` 和 `/plan ...`。
+- 可选 Langfuse tracing 由 `fsagent.langfuse_integration` 封装，runtime 和 API 代码不应直接依赖 Langfuse SDK 细节。
 - 前端位于 `frontend/`，使用 Vite、React 和 TypeScript。
 
 ## 目录约定
 
 - `fsagent/api/`：FastAPI schema、server 和 session service。
+- `fsagent/langfuse_integration.py`：可选 Langfuse adapter，负责环境变量解析、CallbackHandler、root observation 和 client lifecycle。
 - `fsagent/runtime/`：Fast/Plan runtime、planner、executor、MCP、模型配置和状态定义。
 - `fsagent/tests/`：Python 单元测试。
 - `frontend/src/`：前端应用代码。
@@ -84,11 +86,15 @@ npm exec -- playwright test --config playwright.controlled-replay.config.mjs
 - `mcp.json` 是本地 MCP 配置文件，默认被 `.gitignore` 忽略；不要把包含本地 token、API key 或私人 server 的配置提交到仓库。
 - MCP 配置可能启动本地进程。只有在用户明确要求或确认信任当前项目配置时，才启用项目 stdio MCP server。
 - API 中对应字段为 `trustProjectMcp`。
+- Langfuse tracing 是可选集成。不要提交真实 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`；`.env.example` 只能使用示例 key。
+- fsagent 自定义 Langfuse root observation 只应写入低风险摘要，不要主动写入完整用户消息、工具参数、工具返回正文或模型输出正文。
+- Langfuse callback、observation update、shutdown 或配置解析问题不应导致 fsagent run 或 API shutdown 失败；修改相关代码时保持降级路径。
 
 ## 测试策略
 
 - 修复 bug 时，应优先添加能复现问题的测试，再修复实现。
 - 修改 API schema、session 状态或 runtime 输出时，检查 `fsagent/tests/test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py` 等相关测试。
+- 修改 Langfuse tracing、环境变量解析、callback 注入或 shutdown lifecycle 时，检查 `fsagent/tests/test_langfuse_integration.py` 和 `fsagent/tests/test_api.py`；必要时同时运行 `test_observability.py`、`test_agent_observability.py`。
 - 修改开发启动器时，检查 `fsagent/tests/test_dev.py`。
 - 修改模型配置逻辑时，检查 `fsagent/tests/test_model_config.py`。
 - 修改 slash 命令路由时，检查 `fsagent/tests/test_slash_router.py`。

@@ -12,6 +12,7 @@
 - 验证记录：Plan 执行可附带验证命令，结果写入 `verification` 并进入最终报告。
 - HTTP + SSE：创建 run、审核 review、读取 session 都可走普通请求或流式接口。
 - 显式模式路由：`/fast ...` 与 `/plan ...` 由 `fsagent.slash_router` 统一解析。
+- 可选 Langfuse tracing：后端可把 Fast/Plan runtime 调用和 LangChain/DeepAgents span 发送到自托管 Langfuse。
 
 ## 目录结构
 
@@ -22,6 +23,7 @@
 │   ├── runtime/               # Fast/Plan runtime、planner、executor、policy、MCP、verification
 │   ├── tests/                 # Python 单元测试
 │   ├── dev.py                 # API + 前端开发启动器：fsagent-dev
+│   ├── langfuse_integration.py # 可选 Langfuse tracing adapter
 │   └── slash_router.py        # /fast 和 /plan 模式路由
 ├── frontend/                  # Vite + React + TypeScript 前端
 ├── docs/                      # 设计说明和测试记录
@@ -92,9 +94,9 @@ LANGFUSE_DEBUG=false
 - `FSAGENT_SESSION_STORE_PATH`：设置后启用 `JsonlSessionStore`；未设置时使用 `InMemorySessionStore`。
 - `FSAGENT_CHECKPOINTER_PATH`：当前只作为 checkpoint reference 被记录，不会自动启用完整的 LangGraph 持久化恢复。
 - `FSAGENT_LOG_LEVEL`、`FSAGENT_LOG_FILE`：控制 JSONL 日志级别与输出位置。
-- `FSAGENT_LANGFUSE_ENABLED`：设为 `true` 且同时提供 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 后，后端会把 Fast/Plan runtime 调用和 LangChain/DeepAgents span 发送到 Langfuse。
+- `FSAGENT_LANGFUSE_ENABLED`：设为 `true` 且同时提供 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 后，后端会把 Fast/Plan runtime 调用和 LangChain/DeepAgents span 发送到 Langfuse；缺少 key 时会自动保持禁用。
 - `LANGFUSE_BASE_URL`：自托管 Langfuse 地址；本地 Docker 映射可使用 `http://127.0.0.1:13000`。
-- `LANGFUSE_SAMPLE_RATE`、`LANGFUSE_DEBUG`：分别控制采样率和 SDK 调试日志。
+- `LANGFUSE_SAMPLE_RATE`、`LANGFUSE_DEBUG`：分别控制采样率和 SDK 调试日志；无效采样率会禁用本项目的可选 tracing，避免影响 API 启动。
 
 ## 运行
 
@@ -157,6 +159,13 @@ LANGFUSE_BASE_URL=http://127.0.0.1:13000
 
 4. 启动 API 或一键开发脚本。
 5. 发起一次 `/fast` 或 `/plan` run 后，在 Langfuse trace table 中按 tag `fsagent` 或 metadata `thread_id` 过滤。
+
+实现细节：
+
+- 每次 runtime invoke/stream 会创建一个 `fsagent.{mode}.{operation}` root observation。
+- root observation 的 input/output 只写入摘要，例如 `mode`、`message_count`、结果 key 或错误类型；完整 prompt 内容只由 Langfuse LangChain callback 按 SDK 行为采集。
+- runtime 失败时 root observation 会标记为 `ERROR` 并记录 `status_message`。
+- Langfuse callback、observation update 或 shutdown 失败不会中断 fsagent run 或 FastAPI shutdown。
 
 自托管版本需与当前 Langfuse Python SDK 兼容。若没有 trace 出现，先检查 Langfuse UI 中显示的平台版本，再运行：
 
@@ -401,6 +410,8 @@ FSAGENT_LOG_LEVEL=DEBUG FSAGENT_LOG_FILE=logs/fsagent-api.jsonl ./scripts/start-
 - `agent.*` 事件会通过 `agent_mode` 与 `phase` 区分 `fast_runner`、`planner`、`executor`。
 - 默认只记录摘要与元数据，不记录完整 prompt、工具参数正文或工具返回正文。
 
+Langfuse tracing 也遵循相同原则：fsagent 自定义 root observation 只记录低风险摘要；不要在 adapter 中主动写入完整用户消息、工具参数或模型输出正文。
+
 ## 测试与质量检查
 
 在 `harnessagents/fsagent/` 目录运行：
@@ -427,6 +438,7 @@ uv run --project harnessagents/fsagent --group test pytest harnessagents/fsagent
 - 开发启动器入口：`fsagent.dev:main`
 - 变更 runtime 行为时，优先补充 `fsagent/tests/` 对应测试。
 - 变更 API schema、session 状态或 runtime 输出时，优先检查 `test_api.py`、`test_graph.py`、`test_planner.py`、`test_executor.py`。
+- 变更 Langfuse tracing、环境变量解析或可观测性降级行为时，优先检查 `test_langfuse_integration.py`、`test_api.py`、`test_observability.py`、`test_agent_observability.py`。
 - 变更开发启动器时，优先检查 `test_dev.py`。
 - 变更模型配置逻辑时，优先检查 `test_model_config.py`。
 - 变更 slash 模式路由时，优先检查 `test_slash_router.py`。
