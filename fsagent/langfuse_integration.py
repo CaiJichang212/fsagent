@@ -28,12 +28,18 @@ class LangfuseSettings:
         secret_key = _stripped(values.get("LANGFUSE_SECRET_KEY"))
         enabled = explicit_enabled and bool(public_key and secret_key)
         base_url = _stripped(values.get("LANGFUSE_BASE_URL")) or _stripped(values.get("LANGFUSE_HOST")) or cls.base_url
+        sample_rate = None
+        if enabled:
+            try:
+                sample_rate = _optional_float(values.get("LANGFUSE_SAMPLE_RATE"))
+            except ValueError:
+                enabled = False
         return cls(
             enabled=enabled,
             public_key=public_key,
             secret_key=secret_key,
             base_url=base_url,
-            sample_rate=_optional_float(values.get("LANGFUSE_SAMPLE_RATE")) if enabled else None,
+            sample_rate=sample_rate if enabled else None,
             debug=_bool_env(values.get("LANGFUSE_DEBUG"), default=False),
         )
 
