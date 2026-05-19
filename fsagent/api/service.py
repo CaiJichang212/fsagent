@@ -103,7 +103,13 @@ class FsAgentApiService:
 
     def shutdown(self) -> None:
         """Shutdown service-owned integrations."""
-        self._langfuse.shutdown()
+        try:
+            self._langfuse.shutdown()
+        except Exception:
+            logger.exception(
+                "Service integration shutdown failed; continuing shutdown.",
+                extra={"event": "service.integration_shutdown_failed"},
+            )
 
     async def create_run(self, request: RunRequest) -> SessionResponse:
         """Create and invoke a Fast or Plan run."""
@@ -488,6 +494,7 @@ class FsAgentApiService:
                 result = await record.runtime.ainvoke(payload, config=self._runtime_config(record))
             except Exception as exc:  # noqa: BLE001
                 self._mark_failed(record, exc)
+                self._update_langfuse_error_observation(record, observation, exc)
                 return
             self._update_langfuse_observation(record, observation, result)
 
@@ -515,6 +522,7 @@ class FsAgentApiService:
                     )
                 except Exception as exc:  # noqa: BLE001
                     self._mark_failed(record, exc)
+                    self._update_langfuse_error_observation(record, observation, exc)
                 else:
                     self._update_langfuse_observation(record, observation, result)
                     self._apply_runtime_result(record, result, default_status=default_status)
@@ -659,6 +667,23 @@ class FsAgentApiService:
             return
         try:
             observation.update(output=_summarize_payload_for_langfuse(result))
+        except Exception as exc:  # noqa: BLE001
+            self._log_langfuse_exception(record, "langfuse.update_failed", "Langfuse observation update failed.", exc)
+
+    def _update_langfuse_error_observation(
+        self,
+        record: SessionRecord,
+        observation: object | None,
+        error: Exception,
+    ) -> None:
+        if observation is None:
+            return
+        try:
+            observation.update(
+                level="ERROR",
+                status_message=str(error),
+                output={"error_type": type(error).__name__},
+            )
         except Exception as exc:  # noqa: BLE001
             self._log_langfuse_exception(record, "langfuse.update_failed", "Langfuse observation update failed.", exc)
 
